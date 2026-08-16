@@ -1,0 +1,1520 @@
+import 'package:path_provider/path_provider.dart';
+import 'dart:async';
+
+import 'package:share_plus/share_plus.dart';
+import 'dart:io';
+import 'package:path/path.dart' as path;
+import 'dart:ui' as ui;
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:isar/isar.dart';
+
+import '../../../../core/models/lesson.dart';
+import '../../../../core/models/settings.dart';
+import '../../../../core/models/classroom.dart';
+import '../../../../core/models/teacher.dart';
+import '../../../../core/providers/database_provider.dart';
+import '../../../../core/exceptions/timetable_generation_exception.dart';
+import '../../domain/usecases/pdf_export_usecase.dart';
+import '../../domain/usecases/excel_export_usecase.dart';
+import '../providers/timetable_provider.dart';
+import '../../../../core/utils/timetable_display_utils.dart';
+
+class _ExportExcelIntent extends Intent {
+  const _ExportExcelIntent();
+}
+
+class _ExportPdfIntent extends Intent {
+  const _ExportPdfIntent();
+}
+
+class ConflictMessageMapper {
+  static String map(ConflictReason reason) {
+    if (reason is TeacherLoadExceeded) {
+      return 'المعلم "${reason.teacherName}": تجاوز الحد الأقصى للحصص (${reason.currentLoad} / ${reason.maxLoad}).';
+    } else if (reason is InsufficientDaysForSubject) {
+      return 'مادة "${reason.subjectName}": تحتاج ${reason.requiredLessons} حصص ولكن متاح ${reason.availableDays} أيام فقط.';
+    } else if (reason is TeacherTimeSlotConflict) {
+      return 'المعلم "${reason.teacherName}": تعارض في اليوم ${reason.day + 1} الحصة ${reason.period + 1}.';
+    } else if (reason is UnassignedSubject) {
+      return 'مادة "${reason.subjectName}": ${reason.details}';
+    } else if (reason is GenericSolverFailure) {
+      return 'خطأ عام: ${reason.details}';
+    } else if (reason is ClassroomTimeSlotConflict) {
+      return 'الفصل "${reason.classroomName}": تعارض في اليوم ${reason.day + 1} الحصة ${reason.period + 1}.';
+    } else if (reason is TeacherUnavailableDayConflict) {
+      return 'المعلم "${reason.teacherName}": غير متوفر في اليوم ${reason.day + 1}.';
+    } else if (reason is TeacherNotAllowedPeriodConflict) {
+      return 'المعلم "${reason.teacherName}": غير مسموح له بالتدريس في الحصة ${reason.period + 1}.';
+    } else if (reason is SubjectMaxPerDayExceeded) {
+      return 'مادة "${reason.subjectName}" (الفصل "${reason.classroomName}"): تجاوز الحد الأقصى في اليوم ${reason.day + 1} (${reason.currentCount} حصص، المسموح ${reason.maxAllowed}).';
+    } else if (reason is SubjectNotAllowedPeriodConflict) {
+      return 'مادة "${reason.subjectName}": غير مسموح بتدريسها في الحصة ${reason.period + 1}.';
+    } else if (reason is NonConsecutiveSubjectPeriodsConflict) {
+      return 'مادة "${reason.subjectName}" (الفصل "${reason.classroomName}"): الحصص غير متتالية في اليوم ${reason.day + 1}.';
+    }
+    return 'سبب غير معروف للصراع.';
+  }
+}
+
+class TimetablePage extends ConsumerStatefulWidget {
+  const TimetablePage({super.key});
+
+  @override
+  ConsumerState<TimetablePage> createState() => _TimetablePageState();
+}
+
+class _TimetablePageState extends ConsumerState<TimetablePage> {
+  final Map<int, GlobalKey> _classroomKeys = {};
+  final GlobalKey _exportKey = GlobalKey();
+  final GlobalKey _timetableViewportKey = GlobalKey();
+  final GlobalKey _visibleTimetableKey = GlobalKey();
+  final TransformationController _transformationController =
+      TransformationController();
+
+  @override
+  void initState() {
+    super.initState();
+  }
+
+  @override
+  void dispose() {
+    _transformationController.dispose();
+    super.dispose();
+  }
+
+  void _centerTimetableKeepingScale() {
+    final currentScale = _transformationController.value.getMaxScaleOnAxis();
+    if (!currentScale.isFinite || currentScale <= 0) return;
+
+    final viewportObject =
+        _timetableViewportKey.currentContext?.findRenderObject();
+    final contentObject =
+        _visibleTimetableKey.currentContext?.findRenderObject();
+
+    if (viewportObject is! RenderBox ||
+        contentObject is! RenderBox ||
+        !viewportObject.hasSize ||
+        !contentObject.hasSize) {
+      return;
+    }
+
+    final viewportOrigin = viewportObject.localToGlobal(Offset.zero);
+    final contentOrigin = contentObject.localToGlobal(Offset.zero);
+    final contentBottomRight = contentObject
+        .localToGlobal(contentObject.size.bottomRight(Offset.zero));
+    final contentRect = Rect.fromPoints(contentOrigin, contentBottomRight);
+    final viewportCenter = viewportOrigin +
+        Offset(viewportObject.size.width / 2, viewportObject.size.height / 2);
+    final translationDelta = viewportCenter - contentRect.center;
+
+    final centeredMatrix = _transformationController.value.clone();
+    centeredMatrix.setTranslationRaw(
+      centeredMatrix.storage[12] + translationDelta.dx,
+      centeredMatrix.storage[13] + translationDelta.dy,
+      centeredMatrix.storage[14],
+    );
+    _transformationController.value = centeredMatrix;
+  }
+
+  Future<void> _exportTeacherPdf() async {
+    try {
+      final isar = await ref.read(isarDatabaseProvider.future);
+
+      final List<Lesson> lessons = isar.txnSync(() {
+        final all = isar.lessons.where().findAllSync();
+        for (var lesson in all) {
+          lesson.classroom.loadSync();
+          lesson.subject.loadSync();
+          lesson.teacher.loadSync();
+        }
+        return all;
+      });
+
+      final teachers = await isar.collection<Teacher>().where().findAll();
+      final settingsList = await isar.appSettings.where().findAll();
+      final settings = settingsList.isNotEmpty
+          ? settingsList.first
+          : (AppSettings()..periodsPerDay = 7);
+
+      final pdfUsecase = PdfExportUseCase();
+      final pdfBytes = await pdfUsecase.generateTeacherTimetablePdf(
+          lessons, teachers, settings);
+
+      String? outputFile = await FilePicker.platform.saveFile(
+        dialogTitle: 'حفظ ملف PDF',
+        fileName: 'teachers_timetable.pdf',
+        type: FileType.custom,
+        allowedExtensions: ['pdf'],
+        bytes: pdfBytes,
+      );
+
+      if (outputFile != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('تم حفظ الملف بنجاح: $outputFile'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('حدث خطأ أثناء التصدير: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _exportToPdf() async {
+    try {
+      final isar = await ref.read(isarDatabaseProvider.future);
+
+      // Load and guarantee all links are resolved within a single transaction
+      final List<Lesson> lessons = isar.txnSync(() {
+        final all = isar.lessons.where().findAllSync();
+        for (var lesson in all) {
+          lesson.classroom.loadSync();
+          lesson.subject.loadSync();
+          lesson.teacher.loadSync();
+        }
+        return all;
+      });
+
+      final classRooms = await isar.collection<Classroom>().where().findAll();
+      final settingsList = await isar.appSettings.where().findAll();
+      final settings = settingsList.isNotEmpty
+          ? settingsList.first
+          : (AppSettings()..periodsPerDay = 7);
+
+      final pdfUsecase = PdfExportUseCase();
+      final pdfBytes =
+          await pdfUsecase.generateTimetablePdf(lessons, classRooms, settings);
+
+      String? outputFile = await FilePicker.platform.saveFile(
+        dialogTitle: 'حفظ ملف PDF',
+        fileName: 'timetable.pdf',
+        type: FileType.custom,
+        allowedExtensions: ['pdf'],
+        bytes: pdfBytes,
+      );
+
+      if (outputFile != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('تم حفظ الملف بنجاح: $outputFile'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('حدث خطأ أثناء التصدير: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _exportToExcel() async {
+    final settingsAsync = ref.read(timetableNotifierProvider);
+    final isarAsync = ref.read(isarDatabaseProvider);
+
+    if (settingsAsync is! AsyncData || isarAsync is! AsyncData) return;
+
+    final lessons = settingsAsync.value ?? [];
+    final isar = isarAsync.value;
+    if (isar == null) return;
+
+    final classrooms = await isar.classrooms.where().findAll();
+    final settingsList = await isar.appSettings.where().findAll();
+    final settings = settingsList.isNotEmpty
+        ? settingsList.first
+        : (AppSettings()..periodsPerDay = 7);
+
+    final usecase = ExcelExportUseCase();
+    final excelBytes =
+        await usecase.generateTimetableExcel(lessons, classrooms, settings);
+
+    if (Platform.isWindows) {
+      final outputFile = await FilePicker.platform.saveFile(
+        dialogTitle: 'حفظ ملف Excel',
+        fileName: 'timetable_export.xlsx',
+        type: FileType.custom,
+        allowedExtensions: ['xlsx'],
+        bytes: Uint8List.fromList(excelBytes),
+      );
+      if (outputFile != null && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('تم حفظ الملف بنجاح: $outputFile'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+      return;
+    }
+
+    final tempDir = await getTemporaryDirectory();
+    final file = File(path.join(tempDir.path, 'timetable_export.xlsx'));
+    await file.writeAsBytes(excelBytes);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('تم تصدير الجدول إلى Excel بنجاح')),
+      );
+      await SharePlus.instance.share(
+        ShareParams(
+          files: [XFile(file.path)],
+          text: 'جدول الفصول الأسبوعي',
+        ),
+      );
+    }
+  }
+
+  Future<void> _exportToImage() async {
+    try {
+      final boundary = _exportKey.currentContext?.findRenderObject()
+          as RenderRepaintBoundary?;
+
+      if (boundary == null) throw 'تعذر العثور على منطقة الجدول لالتقاطها';
+
+      // Build the image with high pixel ratio for 300DPI-like quality
+      final ui.Image image = await boundary.toImage(pixelRatio: 2.0);
+      final ByteData? byteData =
+          await image.toByteData(format: ui.ImageByteFormat.png);
+
+      if (byteData == null) throw 'فشل في تحويل الجدول إلى بيانات صورة';
+
+      final Uint8List pngBytes = byteData.buffer.asUint8List();
+
+      if (Platform.isWindows) {
+        final outputFile = await FilePicker.platform.saveFile(
+          dialogTitle: 'حفظ صورة الجدول',
+          fileName: 'timetable_export.png',
+          type: FileType.custom,
+          allowedExtensions: ['png'],
+          bytes: pngBytes,
+        );
+        if (outputFile != null && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('تم حفظ الصورة بنجاح: $outputFile'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        }
+        return;
+      }
+
+      final tempDir = await getTemporaryDirectory();
+      final file = File(path.join(tempDir.path, 'timetable_export.png'));
+      await file.writeAsBytes(pngBytes);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('تم التقاط الجدول بنجاح، جاري المشاركة...'),
+            backgroundColor: Colors.green,
+          ),
+        );
+        await SharePlus.instance.share(
+          ShareParams(
+            files: [XFile(file.path)],
+            text: 'جدول الدروس (صورة)',
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('حدث خطأ أثناء تصدير الصورة: $e'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    }
+  }
+
+  void _showAutoFixFailureDialog(List<ConflictDiagnostic> diagnostics) {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('القيود تتعارض مع بعضها',
+            style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold)),
+        content: ConstrainedBox(
+          constraints: BoxConstraints(
+              maxHeight: MediaQuery.of(context).size.height * 0.6),
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: diagnostics.map((diagnostic) {
+                final message = ConflictMessageMapper.map(diagnostic.reason);
+                return Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 4.0),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text('• ',
+                          style: TextStyle(
+                              fontSize: 16, fontWeight: FontWeight.bold)),
+                      Expanded(
+                        child:
+                            Text(message, style: const TextStyle(fontSize: 14)),
+                      ),
+                    ],
+                  ),
+                );
+              }).toList(),
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('حسناً', style: TextStyle(fontSize: 18)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    ref.listen<AsyncValue<List<Lesson>>>(timetableNotifierProvider,
+        (previous, next) {
+      next.whenOrNull(
+        error: (error, stackTrace) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(error.toString()),
+              backgroundColor: Colors.red,
+              duration: const Duration(seconds: 8),
+              behavior: SnackBarBehavior.floating,
+              margin: const EdgeInsets.all(16),
+            ),
+          );
+        },
+      );
+    });
+
+    final lessonsAsync = ref.watch(timetableNotifierProvider);
+    final autoFixState = ref.watch(timetableAutoFixStateProvider);
+    final conflictingLessonIds = {
+      for (final diagnostic in autoFixState.diagnostics)
+        if (diagnostic.isHard) ...diagnostic.lessonIds,
+    };
+    final isarAsync = ref.watch(isarDatabaseProvider);
+
+    final scaffold = Scaffold(
+      appBar: AppBar(
+        title: const Text('جدول الدروس'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.table_chart),
+            tooltip: 'تصدير كـ Excel',
+            onPressed: _exportToExcel,
+          ),
+          IconButton(
+            icon: const Icon(Icons.picture_as_pdf),
+            tooltip: 'تصدير جدول الفصول كـ PDF',
+            onPressed: _exportToPdf,
+          ),
+          IconButton(
+            icon: const Icon(Icons.person_pin_circle),
+            tooltip: 'تصدير جدول المدرسين كـ PDF',
+            onPressed: _exportTeacherPdf,
+          ),
+          IconButton(
+            icon: const Icon(Icons.image),
+            tooltip: 'تصدير كـ صورة',
+            onPressed: _exportToImage,
+          ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          lessonsAsync.when(
+            data: (lessons) {
+              return isarAsync.when(
+                data: (isar) => FutureBuilder(
+                  future: Future.wait([
+                    isar.appSettings.where().findAll(),
+                    isar.classrooms.where().findAll(),
+                  ]),
+                  builder: (context, AsyncSnapshot<List<dynamic>> snapshot) {
+                    if (snapshot.connectionState == ConnectionState.waiting) {
+                      return const Center(child: CircularProgressIndicator());
+                    }
+                    final settingsList =
+                        snapshot.data?[0] as List<AppSettings>?;
+                    final settings =
+                        (settingsList != null && settingsList.isNotEmpty)
+                            ? settingsList.first
+                            : (AppSettings()..periodsPerDay = 7);
+                    final classrooms = (snapshot.data?[1] as List<Classroom>? ??
+                        [])
+                      ..sort((a, b) => a.id.compareTo(b.id));
+
+                    return _buildTimetableGrid(
+                      context,
+                      lessons,
+                      classrooms,
+                      settings,
+                      conflictingLessonIds,
+                    );
+                  },
+                ),
+                loading: () => const Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      CircularProgressIndicator(),
+                      SizedBox(height: 16),
+                      Text(
+                          'جاري تحليل ملايين الاحتمالات لإيجاد أفضل جدول... يرجى الانتظار (قد يستغرق دقيقة)',
+                          style: TextStyle(
+                              fontWeight: FontWeight.bold, fontSize: 16),
+                          textAlign: TextAlign.center),
+                    ],
+                  ),
+                ),
+                error: (e, st) =>
+                    Center(child: Text('خطأ في جلب الإعدادات: $e')),
+              );
+            },
+            loading: () => const Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  CircularProgressIndicator(),
+                  SizedBox(height: 16),
+                  Text(
+                      'جاري تحليل ملايين الاحتمالات لإيجاد أفضل جدول... يرجى الانتظار (قد يستغرق دقيقة)',
+                      style:
+                          TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                      textAlign: TextAlign.center),
+                ],
+              ),
+            ),
+            error: (e, st) => Center(child: Text('حدث خطأ: $e')),
+          ),
+
+          // Off-screen export widget that is painted but invisible and unconstrained
+          lessonsAsync.maybeWhen(
+            data: (lessons) => isarAsync.maybeWhen(
+              data: (isar) => FutureBuilder(
+                future: Future.wait([
+                  isar.appSettings.where().findAll(),
+                  isar.classrooms.where().findAll(),
+                ]),
+                builder: (context, AsyncSnapshot<List<dynamic>> snapshot) {
+                  if (snapshot.connectionState == ConnectionState.waiting) {
+                    return const SizedBox.shrink();
+                  }
+                  final settingsList = snapshot.data?[0] as List<AppSettings>?;
+                  final settings =
+                      (settingsList != null && settingsList.isNotEmpty)
+                          ? settingsList.first
+                          : (AppSettings()..periodsPerDay = 7);
+                  final classrooms = (snapshot.data?[1] as List<Classroom>? ??
+                      [])
+                    ..sort((a, b) => a.id.compareTo(b.id));
+
+                  return Positioned(
+                    top: -10000,
+                    left: -10000,
+                    child: IgnorePointer(
+                      child: UnconstrainedBox(
+                        clipBehavior: Clip.hardEdge,
+                        child: IntrinsicHeight(
+                          child:
+                              _buildExportGrid(lessons, classrooms, settings),
+                        ),
+                      ),
+                    ),
+                  );
+                },
+              ),
+              orElse: () => const SizedBox.shrink(),
+            ),
+            orElse: () => const SizedBox.shrink(),
+          ),
+        ],
+      ),
+      floatingActionButton: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          FloatingActionButton(
+            heroTag: "btn_zoom_reset",
+            onPressed: _centerTimetableKeepingScale,
+            tooltip: 'توسيط الجدول مع الحفاظ على المقياس',
+            child: const Icon(Icons.fit_screen),
+          ),
+          const SizedBox(height: 8),
+          FloatingActionButton(
+            heroTag: "btn_zoom_in",
+            onPressed: () {
+              final size = MediaQuery.of(context).size;
+              final center = Offset(size.width / 2, size.height / 2);
+              const scale = 1.2;
+
+              final Matrix4 matrix = _transformationController.value.clone();
+
+              // Validate maxScale (assuming 5.0 is the maxScale configured)
+              final currentScale = matrix.getMaxScaleOnAxis();
+              if (currentScale * scale > 5.0) return;
+
+              matrix.translate(center.dx, center.dy);
+              matrix.scale(scale, scale, 1.0);
+              matrix.translate(-center.dx, -center.dy);
+
+              _transformationController.value = matrix;
+            },
+            tooltip: 'تكبير',
+            child: const Icon(Icons.zoom_in),
+          ),
+          const SizedBox(height: 8),
+          FloatingActionButton(
+            heroTag: "btn_zoom_out",
+            onPressed: () {
+              final size = MediaQuery.of(context).size;
+              final center = Offset(size.width / 2, size.height / 2);
+              const scale = 1 / 1.2;
+
+              final Matrix4 matrix = _transformationController.value.clone();
+
+              // Validate minScale (assuming 0.1 is the minScale configured)
+              final currentScale = matrix.getMaxScaleOnAxis();
+              if (currentScale * scale < 0.1) return;
+
+              matrix.translate(center.dx, center.dy);
+              matrix.scale(scale, scale, 1.0);
+              matrix.translate(-center.dx, -center.dy);
+
+              _transformationController.value = matrix;
+            },
+            tooltip: 'تصغير',
+            child: const Icon(Icons.zoom_out),
+          ),
+          if (autoFixState.isPreview) ...[
+            FloatingActionButton.extended(
+              heroTag: "btn_auto_fix",
+              onPressed: autoFixState.canFix
+                  ? () async {
+                      final resolved = await ref
+                          .read(timetableNotifierProvider.notifier)
+                          .runSmartAutoFix();
+                      if (!mounted) return;
+                      if (resolved) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('تم حل القيود واعتماد الجدول بنجاح.'),
+                            backgroundColor: Colors.green,
+                          ),
+                        );
+                        return;
+                      }
+                      final failedState =
+                          ref.read(timetableAutoFixStateProvider);
+                      _showAutoFixFailureDialog(failedState.diagnostics);
+                    }
+                  : null,
+              label: Text(
+                autoFixState.isFixing
+                    ? 'جاري الحل...'
+                    : autoFixState.status == TimetableAutoFixStatus.failed
+                        ? 'إعادة حل القيود'
+                        : 'حل القيود تلقائياً',
+              ),
+              icon: autoFixState.isFixing
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.auto_fix_high),
+            ),
+            if (autoFixState.isFixing)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: DecoratedBox(
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.primary,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Padding(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    child: Text(
+                      'جاري تنفيذ المحاولة ${autoFixState.currentAttempt} من ${autoFixState.totalAttempts}...',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+                ),
+              ),
+            const SizedBox(height: 8),
+          ],
+          const SizedBox(height: 8),
+          FloatingActionButton.extended(
+            heroTag: "btn_generate",
+            onPressed: () async {
+              try {
+                await ref
+                    .read(timetableNotifierProvider.notifier)
+                    .generateTimetable();
+              } on TimetableGenerationException catch (e) {
+                if (!mounted) return;
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('القيود تتعارض مع بعضها',
+                        style: TextStyle(
+                            color: Colors.red, fontWeight: FontWeight.bold)),
+                    content: ConstrainedBox(
+                      constraints: BoxConstraints(
+                          maxHeight: MediaQuery.of(context).size.height * 0.6),
+                      child: SingleChildScrollView(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: e.reasons.map((reason) {
+                            final message = ConflictMessageMapper.map(reason);
+                            return Padding(
+                              padding:
+                                  const EdgeInsets.symmetric(vertical: 4.0),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  const Text('• ',
+                                      style: TextStyle(
+                                          fontSize: 16,
+                                          fontWeight: FontWeight.bold)),
+                                  Expanded(
+                                      child: Text(message,
+                                          style:
+                                              const TextStyle(fontSize: 14))),
+                                ],
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      ),
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child:
+                            const Text('حسناً', style: TextStyle(fontSize: 18)),
+                      ),
+                    ],
+                  ),
+                );
+              } catch (e) {
+                if (!mounted) return;
+                String errorMessage =
+                    e.toString().replaceAll('Exception:', '').trim();
+                showDialog(
+                  context: context,
+                  builder: (context) => AlertDialog(
+                    title: const Text('عذراً، تعذر توليد الجدول',
+                        style: TextStyle(
+                            color: Colors.red, fontWeight: FontWeight.bold)),
+                    content: Text(errorMessage,
+                        style: const TextStyle(fontSize: 16, height: 1.5)),
+                    actions: [
+                      TextButton(
+                        onPressed: () => Navigator.pop(context),
+                        child:
+                            const Text('حسناً', style: TextStyle(fontSize: 18)),
+                      ),
+                    ],
+                  ),
+                );
+              }
+            },
+            label: const Text('توليد الجدول'),
+            icon: const Icon(Icons.autorenew),
+          ),
+        ],
+      ),
+    );
+
+    if (!Platform.isWindows) {
+      return scaffold;
+    }
+
+    return Shortcuts(
+      shortcuts: <LogicalKeySet, Intent>{
+        LogicalKeySet(
+          LogicalKeyboardKey.control,
+          LogicalKeyboardKey.keyE,
+        ): const _ExportExcelIntent(),
+        LogicalKeySet(
+          LogicalKeyboardKey.control,
+          LogicalKeyboardKey.keyP,
+        ): const _ExportPdfIntent(),
+      },
+      child: Actions(
+        actions: <Type, Action<Intent>>{
+          _ExportExcelIntent: CallbackAction<_ExportExcelIntent>(
+            onInvoke: (_) {
+              unawaited(_exportToExcel());
+              return null;
+            },
+          ),
+          _ExportPdfIntent: CallbackAction<_ExportPdfIntent>(
+            onInvoke: (_) {
+              unawaited(_exportToPdf());
+              return null;
+            },
+          ),
+        },
+        child: Focus(
+          autofocus: true,
+          child: scaffold,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildExportGrid(
+      List<Lesson> lessons, List<Classroom> classrooms, AppSettings settings) {
+    final assigned = lessons.where((l) => !l.isUnassigned).toList();
+
+    final Map<String, Lesson> lessonMap = {};
+    for (var lesson in assigned) {
+      final cId = lesson.classroom.value?.id;
+      if (cId != null) {
+        lessonMap['${cId}_${lesson.dayIndex}_${lesson.periodIndex}'] = lesson;
+      }
+    }
+
+    final days = ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'];
+    final displayDays = days.take(settings.daysPerWeek).toList();
+
+    List<TableRow> rows = [];
+
+    // Header Row
+    List<Widget> headerCells = [
+      const Center(
+          child: Padding(
+              padding: EdgeInsets.all(8.0),
+              child: Text('اليوم',
+                  textAlign: TextAlign.center,
+                  style:
+                      TextStyle(fontWeight: FontWeight.bold, fontSize: 16)))),
+      const Center(
+          child: Padding(
+              padding: EdgeInsets.all(8.0),
+              child: Text('الدرس',
+                  textAlign: TextAlign.center,
+                  style:
+                      TextStyle(fontWeight: FontWeight.bold, fontSize: 16)))),
+    ];
+
+    for (int c = 0; c < classrooms.length; c++) {
+      var classroom = classrooms[c];
+      bool isFirstInGrade = false;
+      if (c == 0 ||
+          ((classrooms[c - 1].grade as String?) ?? '') !=
+              ((classroom.grade as String?) ?? '')) {
+        isFirstInGrade = true;
+      }
+      bool isLastInGrade = false;
+      if (c == classrooms.length - 1 ||
+          ((classrooms[c + 1].grade as String?) ?? '') !=
+              ((classroom.grade as String?) ?? '')) {
+        isLastInGrade = true;
+      }
+      headerCells.add(Container(
+        padding: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 4.0),
+        decoration: BoxDecoration(
+          border: Border(
+            right: isFirstInGrade
+                ? const BorderSide(color: Colors.black, width: 3.0)
+                : BorderSide.none,
+            left: isLastInGrade
+                ? const BorderSide(color: Colors.black, width: 3.0)
+                : BorderSide.none,
+          ),
+        ),
+        child: Center(
+          child: Text((classroom.name as String?) ?? 'فصل',
+              textAlign: TextAlign.center,
+              style:
+                  const TextStyle(fontWeight: FontWeight.bold, fontSize: 16)),
+        ),
+      ));
+    }
+
+    rows.add(TableRow(
+        decoration: BoxDecoration(color: Colors.grey.shade200),
+        children: headerCells));
+
+    for (int d = 0; d < displayDays.length; d++) {
+      for (int p = 0; p < settings.periodsPerDay; p++) {
+        List<Widget> cells = [];
+
+        if (p == 0) {
+          cells.add(Container(
+            alignment: Alignment.center,
+            padding: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 4.0),
+            child: Text(displayDays[d],
+                style:
+                    const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+          ));
+        } else {
+          cells.add(const SizedBox.shrink());
+        }
+
+        cells.add(Container(
+          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 4.0),
+          child: Text((p + 1).toString(),
+              style:
+                  const TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+        ));
+
+        for (int c = 0; c < classrooms.length; c++) {
+          var classroom = classrooms[c];
+          bool isFirstInGrade = false;
+          if (c == 0 ||
+              ((classrooms[c - 1].grade as String?) ?? '') !=
+                  ((classroom.grade as String?) ?? '')) {
+            isFirstInGrade = true;
+          }
+          bool isLastInGrade = false;
+          if (c == classrooms.length - 1 ||
+              ((classrooms[c + 1].grade as String?) ?? '') !=
+                  ((classroom.grade as String?) ?? '')) {
+            isLastInGrade = true;
+          }
+
+          final lesson = lessonMap['${classroom.id}_${d}_${p}'];
+          if (lesson != null) {
+            final cellLabel = formatTimetableCellLabel(
+              subjectName: lesson.subject.value?.name,
+              companionName: firstTimetableName(lesson.teacher.value?.name),
+            );
+            cells.add(
+              Container(
+                alignment: Alignment.center,
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 4.0, vertical: 2.0),
+                decoration: BoxDecoration(
+                  border: Border(
+                    right: isFirstInGrade
+                        ? const BorderSide(color: Colors.black, width: 3.0)
+                        : BorderSide.none,
+                    left: isLastInGrade
+                        ? const BorderSide(color: Colors.black, width: 3.0)
+                        : BorderSide.none,
+                  ),
+                ),
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    cellLabel,
+                    maxLines: 1,
+                    softWrap: false,
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 9),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ),
+            );
+          } else {
+            cells.add(Container(
+              decoration: BoxDecoration(
+                border: Border(
+                  right: isFirstInGrade
+                      ? const BorderSide(color: Colors.black, width: 3.0)
+                      : BorderSide.none,
+                  left: isLastInGrade
+                      ? const BorderSide(color: Colors.black, width: 3.0)
+                      : BorderSide.none,
+                ),
+              ),
+              child: const SizedBox(height: 32),
+            ));
+          }
+        }
+
+        rows.add(TableRow(
+          decoration: BoxDecoration(
+              color: p % 2 == 0 ? Colors.grey.shade50 : Colors.white),
+          children: cells,
+        ));
+      }
+    }
+
+    final now = DateTime.now();
+    int startYear = now.month >= 9 ? now.year : now.year - 1;
+    final academicYear = '$startYear/${startYear + 1}';
+
+    return RepaintBoundary(
+      key: _exportKey,
+      child: Container(
+        color: Colors.white,
+        padding: const EdgeInsets.all(16.0),
+        child: IntrinsicWidth(
+          child: IntrinsicHeight(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Directionality(
+                  textDirection: TextDirection.rtl,
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Expanded(
+                        flex: 1,
+                        child: Text(
+                          settings.schoolName,
+                          style: const TextStyle(
+                              fontSize: 18,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.black),
+                          textAlign: TextAlign.right,
+                        ),
+                      ),
+                      Expanded(
+                        flex: 2,
+                        child: Column(children: [
+                          const Text(
+                            'جدول الدروس الأسبوعي',
+                            style: TextStyle(
+                                fontSize: 24,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.black),
+                            textAlign: TextAlign.center,
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'العام الدراسي: $academicYear',
+                            style: const TextStyle(
+                                fontSize: 16, color: Colors.black87),
+                            textAlign: TextAlign.center,
+                          ),
+                        ]),
+                      ),
+                      Expanded(
+                        flex: 1,
+                        child: Text(
+                          'المدير : ${settings.principalName}',
+                          style: const TextStyle(
+                              fontSize: 12,
+                              fontWeight: FontWeight.bold,
+                              color: Colors.black),
+                          textAlign: TextAlign.left,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Directionality(
+                  textDirection: TextDirection.rtl,
+                  child: Container(
+                    decoration: BoxDecoration(
+                      border: Border.all(color: Colors.black26),
+                    ),
+                    child: Table(
+                      border: TableBorder.all(color: Colors.black26),
+                      defaultVerticalAlignment:
+                          TableCellVerticalAlignment.middle,
+                      defaultColumnWidth: const IntrinsicColumnWidth(),
+                      columnWidths: const {
+                        0: IntrinsicColumnWidth(),
+                        1: IntrinsicColumnWidth(),
+                      },
+                      children: rows,
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTimetableGrid(
+    BuildContext context,
+    List<Lesson> lessons,
+    List<Classroom> classrooms,
+    AppSettings settings,
+    Set<int> conflictingLessonIds,
+  ) {
+    final assigned = lessons.where((l) => !l.isUnassigned).toList();
+    final unassigned = lessons.where((l) => l.isUnassigned).toList();
+
+    // ⚡ Bolt Optimization: O(n) pass to build a composite map for O(1) lookups
+    // Replaces O(d * p * c * n) rendering complexity with O(d * p * c)
+    final Map<String, Lesson> lessonMap = {};
+    for (var lesson in assigned) {
+      final cId = lesson.classroom.value?.id;
+      if (cId != null) {
+        lessonMap['${cId}_${lesson.dayIndex}_${lesson.periodIndex}'] = lesson;
+      }
+    }
+
+    if (classrooms.isEmpty && unassigned.isNotEmpty) {
+      return Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Center(
+              child:
+                  Text('جميع الدروس المضافة لم يتم جدولتها بعد. اضغط توليد.')),
+          const SizedBox(height: 16),
+          Text('(${unassigned.length} حصة بانتظار التوزيع)',
+              style: const TextStyle(color: Colors.red)),
+        ],
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        if (settings.schoolName.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: Text(
+              settings.schoolName,
+              style: const TextStyle(
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.teal),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        if (unassigned.isNotEmpty)
+          Container(
+            color: Colors.red.shade100,
+            padding: const EdgeInsets.all(8.0),
+            child: Text(
+                'يوجد ${unassigned.length} دروس بانتظار التوزيع (تضارب أو لم يتم التوليد)',
+                style: const TextStyle(
+                    color: Colors.red, fontWeight: FontWeight.bold),
+                textAlign: TextAlign.center),
+          ),
+        Expanded(
+          child: _buildMasterGrid(
+            assigned,
+            classrooms,
+            settings,
+            lessonMap,
+            conflictingLessonIds,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildMasterGrid(
+    List<Lesson> assigned,
+    List<Classroom> classrooms,
+    AppSettings settings,
+    Map<String, Lesson> lessonMap,
+    Set<int> conflictingLessonIds,
+  ) {
+    if (classrooms.isEmpty) {
+      return const Center(child: Text('لا يوجد بيانات لعرضها.'));
+    }
+
+    final days = ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'];
+    final displayDays = days.take(settings.daysPerWeek).toList();
+    final int masterKeyId = 0; // use 0 for the master grid
+    if (!_classroomKeys.containsKey(masterKeyId)) {
+      _classroomKeys[masterKeyId] = GlobalKey();
+    }
+
+    // Build Rows for Table
+    List<TableRow> rows = [];
+
+    List<Widget> headerCells = [
+      const Center(
+          child: Padding(
+              padding: EdgeInsets.all(8.0),
+              child: Text('اليوم',
+                  style: TextStyle(fontWeight: FontWeight.bold)))),
+      const Center(
+          child: Padding(
+              padding: EdgeInsets.all(8.0),
+              child: Text('الدرس',
+                  style: TextStyle(fontWeight: FontWeight.bold)))),
+    ];
+
+    for (int c = 0; c < classrooms.length; c++) {
+      var classroom = classrooms[c];
+      bool isFirstInGrade = false;
+      if (c == 0 ||
+          ((classrooms[c - 1].grade as String?) ?? '') !=
+              ((classroom.grade as String?) ?? '')) {
+        isFirstInGrade = true;
+      }
+      bool isLastInGrade = false;
+      if (c == classrooms.length - 1 ||
+          ((classrooms[c + 1].grade as String?) ?? '') !=
+              ((classroom.grade as String?) ?? '')) {
+        isLastInGrade = true;
+      }
+      headerCells.add(Container(
+        decoration: BoxDecoration(
+          border: Border(
+            right: isFirstInGrade
+                ? const BorderSide(color: Colors.black, width: 3.0)
+                : BorderSide.none,
+            left: isLastInGrade
+                ? const BorderSide(color: Colors.black, width: 3.0)
+                : BorderSide.none,
+          ),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 4.0),
+        child: Center(
+          child: Text((classroom.name as String?) ?? 'فصل',
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+        ),
+      ));
+    }
+
+    rows.add(TableRow(
+        decoration: BoxDecoration(color: Colors.teal.shade100),
+        children: headerCells));
+
+    for (int d = 0; d < displayDays.length; d++) {
+      for (int p = 0; p < settings.periodsPerDay; p++) {
+        List<Widget> cells = [];
+
+        if (p == 0) {
+          cells.add(Container(
+            alignment: Alignment.center,
+            padding: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 4.0),
+            child: Text(displayDays[d],
+                style: const TextStyle(fontWeight: FontWeight.bold)),
+          ));
+        } else {
+          cells.add(const SizedBox.shrink());
+        }
+
+        // Sequence column
+        cells.add(Container(
+          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(horizontal: 4.0, vertical: 4.0),
+          child: Text((p + 1).toString(),
+              style: const TextStyle(fontWeight: FontWeight.bold)),
+        ));
+
+        // Classrooms columns
+        for (int c = 0; c < classrooms.length; c++) {
+          var classroom = classrooms[c];
+          bool isFirstInGrade = false;
+          if (c == 0 ||
+              ((classrooms[c - 1].grade as String?) ?? '') !=
+                  ((classroom.grade as String?) ?? '')) {
+            isFirstInGrade = true;
+          }
+          bool isLastInGrade = false;
+          if (c == classrooms.length - 1 ||
+              ((classrooms[c + 1].grade as String?) ?? '') !=
+                  ((classroom.grade as String?) ?? '')) {
+            isLastInGrade = true;
+          }
+          final lesson = lessonMap['${classroom.id}_${d}_${p}'];
+          cells.add(_buildCell(
+            lesson,
+            classroom,
+            d,
+            p,
+            isFirstInGrade,
+            isLastInGrade,
+            lesson != null && conflictingLessonIds.contains(lesson.id),
+          ));
+        }
+
+        rows.add(TableRow(
+          decoration: BoxDecoration(
+              color: p % 2 == 0 ? Colors.grey.shade50 : Colors.white),
+          children: cells,
+        ));
+      }
+    }
+
+    Widget buildDataTable() {
+      return Container(
+        color: Colors.white,
+        padding: const EdgeInsets.all(16.0),
+        child: Directionality(
+          textDirection: TextDirection.rtl,
+          child: Table(
+            border: TableBorder.all(color: Colors.grey.shade700, width: 1.5),
+            defaultVerticalAlignment: TableCellVerticalAlignment.middle,
+            // السر الأول: تثبيت العرض لكي لا ينهار الجدول
+            defaultColumnWidth: const FixedColumnWidth(150.0),
+            columnWidths: const {
+              0: FixedColumnWidth(60.0),
+              1: FixedColumnWidth(60.0),
+            },
+            children: rows,
+          ),
+        ),
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        return Stack(
+          children: [
+            Positioned(
+              top: -9999,
+              left: -9999,
+              child: IgnorePointer(
+                child: RepaintBoundary(
+                  key: _classroomKeys[masterKeyId],
+                  child: buildDataTable(),
+                ),
+              ),
+            ),
+            Positioned.fill(
+              child: Container(
+                key: _timetableViewportKey,
+                color: Colors.white,
+                child: InteractiveViewer(
+                  boundaryMargin: const EdgeInsets.all(5000.0),
+                  minScale: 0.1,
+                  maxScale: 5.0,
+                  constrained: false, // السر الثاني: السماح للمحتوى بأخذ مساحته
+                  scaleEnabled: true,
+                  panEnabled: true,
+                  alignment: Alignment.center,
+                  transformationController: _transformationController,
+                  // السر الثالث: إزالة SingleChildScrollView الكارثي واستخدام ConstrainedBox فقط
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(
+                      minWidth: constraints.maxWidth,
+                      minHeight: constraints.maxHeight,
+                    ),
+                    child: Center(
+                      child: KeyedSubtree(
+                        key: _visibleTimetableKey,
+                        child: buildDataTable(),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildCell(
+    Lesson? lesson,
+    Classroom classroom,
+    int dayIndex,
+    int periodIndex,
+    bool isFirstInGrade,
+    bool isLastInGrade,
+    bool isConflicting,
+  ) {
+    if (lesson == null) {
+      return DragTarget<Lesson>(
+        onWillAcceptWithDetails: (details) {
+          final incoming = details.data;
+          final timetableNotifier =
+              ref.read(timetableNotifierProvider.notifier);
+
+          if (timetableNotifier.isDragDropOperationInProgress) {
+            return false;
+          }
+          if (incoming.isPinned) {
+            return false;
+          }
+
+          if (incoming.subject.value != null &&
+              (incoming.subject.value?.allowedPeriods.isNotEmpty ?? false) &&
+              !(incoming.subject.value?.allowedPeriods.contains(periodIndex) ??
+                  false)) return false;
+          if (incoming.teacher.value != null &&
+              (incoming.teacher.value?.unavailableDays.contains(dayIndex) ??
+                  false)) return false;
+
+          return true;
+        },
+        onAcceptWithDetails: (details) async {
+          final incoming = details.data;
+          final (success, errorMessage) = await ref
+              .read(timetableNotifierProvider.notifier)
+              .moveLessonToEmpty(incoming, dayIndex, periodIndex);
+
+          if (!success && mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(
+                content: Text(errorMessage ?? 'حدث خطأ أثناء النقل'),
+                backgroundColor: Colors.red,
+              ),
+            );
+          }
+        },
+        builder: (context, candidateData, rejectedData) {
+          return Container(
+            height: 36,
+            decoration: BoxDecoration(
+              color: candidateData.isNotEmpty
+                  ? Colors.green.withValues(alpha: 0.3)
+                  : (rejectedData.isNotEmpty
+                      ? Colors.red.withValues(alpha: 0.3)
+                      : Colors.transparent),
+              border: Border(
+                right: isFirstInGrade
+                    ? const BorderSide(color: Colors.black, width: 3.0)
+                    : BorderSide.none,
+                left: isLastInGrade
+                    ? const BorderSide(color: Colors.black, width: 3.0)
+                    : BorderSide.none,
+              ),
+            ),
+          );
+        },
+      );
+    }
+
+    return DragTarget<Lesson>(
+      onWillAcceptWithDetails: (details) {
+        final incoming = details.data;
+        final timetableNotifier = ref.read(timetableNotifierProvider.notifier);
+
+        return !timetableNotifier.isDragDropOperationInProgress &&
+            incoming.id != lesson.id &&
+            !lesson.isPinned;
+      },
+      onAcceptWithDetails: (details) async {
+        final incoming = details.data;
+        final (success, errorMessage) = await ref
+            .read(timetableNotifierProvider.notifier)
+            .swapLessons(incoming, lesson);
+
+        if (!success && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(errorMessage ?? 'حدث خطأ أثناء التبديل'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      },
+      builder: (context, candidateData, rejectedData) {
+        final cellLabel = formatTimetableCellLabel(
+          subjectName: lesson.subject.value?.name,
+          companionName: firstTimetableName(lesson.teacher.value?.name),
+        );
+        return LongPressDraggable<Lesson>(
+          data: lesson,
+          feedback: Material(
+            color: Colors.transparent,
+            child: Container(
+              color: Colors.teal.withValues(alpha: 0.8),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: Text(
+                  cellLabel,
+                  maxLines: 1,
+                  softWrap: false,
+                  style: const TextStyle(color: Colors.white),
+                ),
+              ),
+            ),
+          ),
+          childWhenDragging: Container(color: Colors.grey.shade200, height: 36),
+          child: GestureDetector(
+            onDoubleTap: () {
+              ref.read(timetableNotifierProvider.notifier).togglePin(lesson);
+            },
+            child: Container(
+              height: 36,
+              padding:
+                  const EdgeInsets.symmetric(horizontal: 4.0, vertical: 2.0),
+              decoration: BoxDecoration(
+                color: isConflicting
+                    ? Colors.red.shade100
+                    : (lesson.isPinned
+                        ? Colors.orange.shade100
+                        : (candidateData.isNotEmpty
+                            ? Colors.red.shade100
+                            : Colors.transparent)),
+                border: Border(
+                  right: isFirstInGrade
+                      ? const BorderSide(color: Colors.black, width: 3.0)
+                      : (lesson.isPinned
+                          ? const BorderSide(color: Colors.orange, width: 2)
+                          : BorderSide.none),
+                  left: isLastInGrade
+                      ? const BorderSide(color: Colors.black, width: 3.0)
+                      : (lesson.isPinned
+                          ? const BorderSide(color: Colors.orange, width: 2)
+                          : BorderSide.none),
+                  top: lesson.isPinned
+                      ? const BorderSide(color: Colors.orange, width: 2)
+                      : BorderSide.none,
+                  bottom: lesson.isPinned
+                      ? const BorderSide(color: Colors.orange, width: 2)
+                      : BorderSide.none,
+                ),
+              ),
+              child: Stack(
+                children: [
+                  Center(
+                    child: FittedBox(
+                      fit: BoxFit.scaleDown,
+                      child: Text(
+                        cellLabel,
+                        maxLines: 1,
+                        softWrap: false,
+                        style: const TextStyle(
+                            fontWeight: FontWeight.bold, fontSize: 9),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  ),
+                  if (lesson.isPinned)
+                    const Positioned(
+                      top: 0,
+                      left: 0,
+                      child: Icon(Icons.lock, size: 12, color: Colors.orange),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}

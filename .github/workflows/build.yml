@@ -1,0 +1,66 @@
+name: Flutter Build
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Java
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - name: Setup Flutter
+      uses: subosito/flutter-action@v2
+      with:
+        channel: 'stable'
+
+    - name: Clean Workspace
+      run: flutter clean
+
+    - name: Get Dependencies
+      run: flutter pub get
+
+    - name: Server-Side Android Fix
+      run: |
+        sed -i 's/flutter.minSdkVersion/21/g' android/app/build.gradle || true
+        sed -i 's/flutter.minSdkVersion/21/g' android/app/build.gradle.kts || true
+        sed -i 's/flutter.compileSdkVersion/36/g' android/app/build.gradle || true
+        sed -i 's/flutter.compileSdkVersion/36/g' android/app/build.gradle.kts || true
+
+    - name: Fix Isar Namespace & SDK Version
+      run: |
+        sed -i 's/compileSdkVersion/namespace "dev.isar.isar_flutter_libs"\n    compileSdkVersion/g' ~/.pub-cache/hosted/pub.dev/isar_flutter_libs-*/android/build.gradle
+        sed -i -E 's/compileSdkVersion [0-9]+/compileSdkVersion 36/g' ~/.pub-cache/hosted/pub.dev/isar_flutter_libs-*/android/build.gradle
+      
+    - name: Generate App Icons
+      run: flutter pub run flutter_launcher_icons
+
+    # الخطوة المدمجة لفك تشفير المفتاح
+    - name: Decode Keystore
+      env:
+        STORE_FILE_BASE64: ${{ secrets.STORE_FILE_BASE64 }}
+      run: |
+        echo $STORE_FILE_BASE64 | base64 --decode > $RUNNER_TEMP/upload-keystore.jks
+
+    # خطوة البناء الموقعة باستخدام المتغيرات
+    - name: Build Android Release
+      env:
+        STORE_FILE: ${{ runner.temp }}/upload-keystore.jks
+        STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      run: flutter build apk --release --android-skip-build-dependency-validation
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: release-apk
+        path: build/app/outputs/flutter-apk/app-release.apk
