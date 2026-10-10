@@ -1,3 +1,5 @@
+// ignore_for_file: deprecated_member_use
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:file_picker/file_picker.dart';
@@ -10,9 +12,18 @@ import 'package:path/path.dart' as path;
 import 'dart:convert';
 import 'dart:typed_data';
 
+import '../../../../core/models/app_config.dart';
+import '../../../../core/models/school_stage.dart';
 import '../../../../core/models/settings.dart';
-import '../../../../core/providers/repository_provider.dart';
+import '../../../../core/models/weekly_load_policy.dart';
+import '../../../../core/providers/app_backup_provider.dart';
+import '../../../../core/providers/app_config_provider.dart';
+import '../../../setup/presentation/pages/first_run_setup_page.dart';
+import '../../../setup/presentation/widgets/school_stage_selector.dart';
+import '../../../setup/presentation/widgets/weekly_load_mode_selector.dart';
+import '../../../timetable/presentation/providers/timetable_provider.dart';
 import '../providers/management_provider.dart';
+import '../providers/subject_constraint_auto_sync_provider.dart';
 
 class SettingsPage extends ConsumerWidget {
   const SettingsPage({super.key});
@@ -20,10 +31,18 @@ class SettingsPage extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final settingsAsync = ref.watch(settingsNotifierProvider);
+    final configAsync = ref.watch(appConfigNotifierProvider);
 
     return Scaffold(
       body: settingsAsync.when(
-        data: (settings) => _SettingsForm(settings: settings),
+        data: (settings) => configAsync.when(
+          data: (config) => _SettingsForm(
+            settings: settings,
+            initialConfig: config,
+          ),
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (e, st) => Center(child: Text('حدث خطأ: $e')),
+        ),
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (e, st) => Center(child: Text('حدث خطأ: $e')),
       ),
@@ -33,7 +52,12 @@ class SettingsPage extends ConsumerWidget {
 
 class _SettingsForm extends ConsumerStatefulWidget {
   final AppSettings settings;
-  const _SettingsForm({required this.settings});
+  final AppConfig initialConfig;
+
+  const _SettingsForm({
+    required this.settings,
+    required this.initialConfig,
+  });
 
   @override
   ConsumerState<_SettingsForm> createState() => _SettingsFormState();
@@ -48,6 +72,11 @@ class _SettingsFormState extends ConsumerState<_SettingsForm> {
   late bool _exportAutoScale;
   late String _schoolName;
   late String _principalName;
+  late SchoolStage _schoolStage;
+  late WeeklyLoadMode _weeklyLoadMode;
+  late OfficialWeeklyPlan _officialWeeklyPlan;
+  final Map<String, TextEditingController> _officialPlanControllers = {};
+  bool _isSaving = false;
   double? _customPageWidth;
   double? _customPageHeight;
 
@@ -61,35 +90,143 @@ class _SettingsFormState extends ConsumerState<_SettingsForm> {
     _exportAutoScale = widget.settings.exportAutoScale;
     _schoolName = widget.settings.schoolName;
     _principalName = widget.settings.principalName;
+    _schoolStage = widget.initialConfig.schoolStage;
+    _weeklyLoadMode = widget.initialConfig.weeklyLoadMode;
+    _officialWeeklyPlan = widget.initialConfig.officialWeeklyPlan;
     _customPageWidth = widget.settings.customPageWidth;
     _customPageHeight = widget.settings.customPageHeight;
+    _initOfficialPlanControllers();
   }
 
-  void _saveSettings() {
-    if (_formKey.currentState!.validate()) {
-      _formKey.currentState!.save();
-      final newSettings = widget.settings
-        ..schoolName = _schoolName
-        ..principalName = _principalName
-        ..periodsPerDay = _periodsPerDay
-        ..daysPerWeek = _daysPerWeek
-        ..exportPageSize = _exportPageSize
-        ..exportOrientation = _exportOrientation
-        ..exportAutoScale = _exportAutoScale
-        ..customPageWidth = _customPageWidth
-        ..customPageHeight = _customPageHeight;
+  void _initOfficialPlanControllers() {
+    for (final track in OfficialPlanTrack.values) {
+      for (final grade in track.grades) {
+        final key = _planEntryKey(track, grade);
+        final lessons = _officialWeeklyPlan.lessonsFor(track, grade);
+        _officialPlanControllers[key] =
+            TextEditingController(text: lessons.toString());
+      }
+    }
+  }
 
-      ref.read(settingsNotifierProvider.notifier).saveSettings(newSettings);
+  String _planEntryKey(OfficialPlanTrack track, AcademicGrade grade) {
+    return '${track.storageKey}:${grade.storageKey}';
+  }
+
+  void _resetOfficialPlanToDefaults() {
+    const defaults = OfficialWeeklyPlan.standard();
+    setState(() {
+      _officialWeeklyPlan = defaults;
+      for (final track in OfficialPlanTrack.values) {
+        for (final grade in track.grades) {
+          final key = _planEntryKey(track, grade);
+          _officialPlanControllers[key]?.text =
+              defaults.lessonsFor(track, grade).toString();
+        }
+      }
+    });
+  }
+
+  @override
+  void dispose() {
+    for (final controller in _officialPlanControllers.values) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _saveSettings() async {
+    if (!_formKey.currentState!.validate()) {
+      return;
+    }
+
+    _formKey.currentState!.save();
+
+    var updatedOfficialPlan = _officialWeeklyPlan;
+    for (final track in OfficialPlanTrack.values) {
+      for (final grade in track.grades) {
+        final key = _planEntryKey(track, grade);
+        final raw = _officialPlanControllers[key]?.text.trim() ?? '';
+        final parsed = int.tryParse(raw);
+        if (parsed != null && parsed > 0) {
+          updatedOfficialPlan = updatedOfficialPlan.copyWithEntry(
+            track: track,
+            grade: grade,
+            weeklyLessons: parsed,
+          );
+        }
+      }
+    }
+    _officialWeeklyPlan = updatedOfficialPlan;
+
+    final newSettings = widget.settings
+      ..schoolName = _schoolName
+      ..principalName = _principalName
+      ..periodsPerDay = _periodsPerDay
+      ..daysPerWeek = _daysPerWeek
+      ..exportPageSize = _exportPageSize
+      ..exportOrientation = _exportOrientation
+      ..exportAutoScale = _exportAutoScale
+      ..customPageWidth = _customPageWidth
+      ..customPageHeight = _customPageHeight;
+
+    setState(() => _isSaving = true);
+
+    try {
+      await ref
+          .read(settingsNotifierProvider.notifier)
+          .saveSettings(newSettings);
+
+      await ref.read(appConfigNotifierProvider.notifier).completeSetup(
+            stage: _schoolStage,
+            weeklyLoadMode: _weeklyLoadMode,
+            officialWeeklyPlan: _officialWeeklyPlan,
+          );
+
+      final outcome = await ref.read(subjectConstraintAutoSyncProvider).run();
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() => _isSaving = false);
+      final summary = outcome?.arabicSummary;
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('تم حفظ الإعدادات بنجاح')),
+        SnackBar(
+          content: Text(
+            summary == null
+                ? 'تم حفظ الإعدادات بنجاح'
+                : 'تم حفظ الإعدادات بنجاح، $summary',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() => _isSaving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('تعذر حفظ الإعدادات: $error'),
+          backgroundColor: Colors.red,
+        ),
       );
     }
   }
 
+  void _openSetupWizard() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (context) => const FirstRunSetupPage(isEditing: true),
+      ),
+    );
+  }
+
   Future<void> _exportData() async {
     try {
-      final backupService = await ref.read(backupServiceProvider.future);
-      final jsonStr = await backupService.exportDatabaseToJson();
+      final backupService = await ref.read(appBackupServiceProvider.future);
+      final jsonStr = await backupService.exportToJson();
 
       final jsonBytes =
           Uint8List.fromList(const Utf8Encoder().convert(jsonStr));
@@ -152,13 +289,18 @@ class _SettingsFormState extends ConsumerState<_SettingsForm> {
         final file = File(result.files.single.path!);
         final jsonStr = await file.readAsString();
 
-        final backupService = await ref.read(backupServiceProvider.future);
-        await backupService.importDatabaseFromJson(jsonStr);
+        final backupService = await ref.read(appBackupServiceProvider.future);
+        await backupService.importFromJson(jsonStr);
 
         if (mounted) {
           ref.invalidate(teachersNotifierProvider);
           ref.invalidate(subjectsNotifierProvider);
           ref.invalidate(classroomsNotifierProvider);
+          ref.invalidate(settingsNotifierProvider);
+          ref.invalidate(timetableNotifierProvider);
+          // ملف الإعدادات (المرحلة وسجلّ القيود التلقائية) يُقرأ من القرص
+          // من جديد بعد الاستيراد حتى تعكس الواجهة حالة النسخة المستوردة.
+          ref.invalidate(appConfigNotifierProvider);
 
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(content: Text('تم استيراد البيانات بنجاح')),
@@ -310,6 +452,82 @@ class _SettingsFormState extends ConsumerState<_SettingsForm> {
     );
   }
 
+  Widget _buildOfficialPlanSection() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(
+                  child: Text(
+                    'الخطة الدراسية الرسمية',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                TextButton.icon(
+                  onPressed: _resetOfficialPlanToDefaults,
+                  icon: const Icon(Icons.restore, size: 18),
+                  label: const Text('استعادة الافتراضي'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'هذه القيم هي القيم الافتراضية ويمكن تعديلها حسب احتياج مدرستك. تعديلها لا يغير الصفوف التي لديها تخصيص مستقل.',
+              style: TextStyle(fontSize: 13, color: Colors.grey.shade800),
+            ),
+            const SizedBox(height: 12),
+            for (final track in OfficialPlanTrack.values) ...[
+              Padding(
+                padding: const EdgeInsets.only(top: 8, bottom: 8),
+                child: Text(
+                  track.label,
+                  style: TextStyle(
+                    fontSize: 14.5,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.teal.shade800,
+                  ),
+                ),
+              ),
+              Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  for (final grade in track.grades)
+                    SizedBox(
+                      width: 125,
+                      child: TextFormField(
+                        controller:
+                            _officialPlanControllers[_planEntryKey(track, grade)],
+                        keyboardType: TextInputType.number,
+                        decoration: InputDecoration(
+                          labelText: grade.label,
+                          suffixText: 'حصة',
+                          border: const OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        validator: (val) {
+                          final parsed = int.tryParse(val?.trim() ?? '');
+                          if (parsed == null || parsed < 1 || parsed > 84) {
+                            return 'رقم غير صالح';
+                          }
+                          return null;
+                        },
+                      ),
+                    ),
+                ],
+              ),
+              const SizedBox(height: 8),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return SingleChildScrollView(
@@ -377,6 +595,81 @@ class _SettingsFormState extends ConsumerState<_SettingsForm> {
                     ),
                   ],
                 ),
+              ),
+            ),
+            const SizedBox(height: 24),
+            const Text('المرحلة الدراسية',
+                style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.teal)),
+            const SizedBox(height: 16),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SchoolStageSelector(
+                      value: _schoolStage,
+                      onChanged: (stage) =>
+                          setState(() => _schoolStage = stage),
+                    ),
+                    const SizedBox(height: 12),
+                    Text(
+                      _schoolStage.description,
+                      style: TextStyle(
+                          fontSize: 13, color: Colors.grey.shade800),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 24),
+            const Text('إعداد الحصص الأسبوعية',
+                style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.teal)),
+            const SizedBox(height: 16),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      'اختر الطريقة الأساسية التي تريد استخدامها لتحديد عدد الحصص للصفوف.',
+                      style: TextStyle(fontWeight: FontWeight.w600),
+                    ),
+                    const SizedBox(height: 8),
+                    WeeklyLoadModeSelector(
+                      value: _weeklyLoadMode,
+                      onChanged: (mode) =>
+                          setState(() => _weeklyLoadMode = mode),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'يمكنك تعديل هذه الإعدادات لاحقًا من الإعدادات أو من تفاصيل الصف. هذا التخصيص اختياري.',
+                      style: TextStyle(
+                          fontSize: 12.5, color: Colors.grey.shade700),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            _buildOfficialPlanSection(),
+            const SizedBox(height: 24),
+            Card(
+              child: ListTile(
+                leading: const Icon(Icons.assignment_outlined,
+                    color: Colors.teal),
+                title: const Text('معالج الإعداد الأولي'),
+                subtitle: const Text(
+                    'مراجعة بيانات المدرسة والمدير والحصص والمرحلة'),
+                trailing: const Icon(Icons.arrow_forward_ios, size: 16),
+                onTap: _openSetupWizard,
               ),
             ),
             const SizedBox(height: 24),
@@ -520,11 +813,17 @@ class _SettingsFormState extends ConsumerState<_SettingsForm> {
             SizedBox(
               width: double.infinity,
               child: ElevatedButton(
-                onPressed: _saveSettings,
+                onPressed: _isSaving ? null : _saveSettings,
                 style:
                     ElevatedButton.styleFrom(padding: const EdgeInsets.all(16)),
-                child:
-                    const Text('حفظ الإعدادات', style: TextStyle(fontSize: 16)),
+                child: _isSaving
+                    ? const SizedBox(
+                        width: 20,
+                        height: 20,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Text('حفظ الإعدادات',
+                        style: TextStyle(fontSize: 16)),
               ),
             ),
           ],

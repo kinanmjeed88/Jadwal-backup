@@ -7,6 +7,7 @@ import '../models/classroom.dart';
 import '../models/lesson.dart';
 import '../models/settings.dart';
 import '../models/subject_consecutiveness.dart';
+import '../models/subject_constraint.dart';
 
 class BackupService {
   final Isar _isar;
@@ -19,6 +20,8 @@ class BackupService {
     final classrooms = await _isar.classrooms.where().findAll();
     final lessons = await _isar.lessons.where().findAll();
     final settings = await _isar.appSettings.where().findAll();
+    final subjectConstraints =
+        await _isar.subjectConstraints.where().findAll();
 
     final Map<String, dynamic> data = {
       'teachers': teachers
@@ -29,6 +32,7 @@ class BackupService {
                 'maxLessonsPerDay': t.maxLessonsPerDay,
                 'maxLessonsPerWeek': t.maxLessonsPerWeek,
                 'unavailableDays': t.unavailableDays,
+                'allowedPeriods': t.allowedPeriods,
               })
           .toList(),
       'subjects': subjects
@@ -46,16 +50,32 @@ class BackupService {
                 'id': c.id,
                 'name': c.name,
                 'grade': c.grade,
+                if (c.weeklyLessonsOverride != null)
+                  'weeklyLessonsOverride': c.weeklyLessonsOverride,
+                if (c.dailyPeriodsOverride != null)
+                  'dailyPeriodsOverride': c.dailyPeriodsOverride,
               })
           .toList(),
       'settings': settings
-          .map((s) => {
-                'id': s.id,
-                'periodsPerDay': s.periodsPerDay,
-                'daysPerWeek': s.daysPerWeek,
-                'exportPageSize': s.exportPageSize,
-                'exportOrientation': s.exportOrientation,
-                'exportAutoScale': s.exportAutoScale,
+            .map((s) => {
+                  'id': s.id,
+                  'schoolName': s.schoolName,
+                  'principalName': s.principalName,
+                  'periodsPerDay': s.periodsPerDay,
+                  'daysPerWeek': s.daysPerWeek,
+                  'exportPageSize': s.exportPageSize,
+                  'exportOrientation': s.exportOrientation,
+                  'exportAutoScale': s.exportAutoScale,
+                  'customPageWidth': s.customPageWidth,
+                  'customPageHeight': s.customPageHeight,
+                })
+            .toList(),
+      'subjectConstraints': subjectConstraints
+          .map((c) => {
+                'id': c.id,
+                'grade': c.grade,
+                'subjectName': c.subjectName,
+                'maxPeriodsPerDay': c.maxPeriodsPerDay,
               })
           .toList(),
       'lessons': lessons
@@ -66,6 +86,7 @@ class BackupService {
                 'classroomId': l.classroom.value?.id,
                 'dayIndex': l.dayIndex,
                 'periodIndex': l.periodIndex,
+                'isPinned': l.isPinned,
               })
           .toList(),
     };
@@ -83,17 +104,22 @@ class BackupService {
       await _isar.classrooms.clear();
       await _isar.lessons.clear();
       await _isar.appSettings.clear();
+      await _isar.subjectConstraints.clear();
 
       if (data.containsKey('settings')) {
         final List<dynamic> settingsList = data['settings'];
         final newSettings = settingsList
             .map((s) => AppSettings()
               ..id = s['id']
+              ..schoolName = s['schoolName'] ?? ''
+              ..principalName = s['principalName'] ?? ''
               ..periodsPerDay = s['periodsPerDay']
               ..daysPerWeek = s['daysPerWeek']
               ..exportPageSize = s['exportPageSize'] ?? 'A4'
               ..exportOrientation = s['exportOrientation'] ?? 'Landscape'
-              ..exportAutoScale = s['exportAutoScale'] ?? true)
+              ..exportAutoScale = s['exportAutoScale'] ?? true
+              ..customPageWidth = (s['customPageWidth'] as num?)?.toDouble()
+              ..customPageHeight = (s['customPageHeight'] as num?)?.toDouble())
             .toList();
         await _isar.appSettings.putAll(newSettings);
       }
@@ -108,7 +134,8 @@ class BackupService {
               ..specialization = t['specialization']
               ..maxLessonsPerDay = t['maxLessonsPerDay']
               ..maxLessonsPerWeek = t['maxLessonsPerWeek']
-              ..unavailableDays = List<int>.from(t['unavailableDays'] ?? []))
+              ..unavailableDays = List<int>.from(t['unavailableDays'] ?? [])
+              ..allowedPeriods = List<int>.from(t['allowedPeriods'] ?? []))
             .toList();
         await _isar.teachers.putAll(newTeachers);
         for (final t in newTeachers) {
@@ -138,16 +165,40 @@ class BackupService {
       final Map<int, Classroom> classroomMap = {};
       if (data.containsKey('classrooms')) {
         final List<dynamic> classroomsList = data['classrooms'];
-        final newClassrooms = classroomsList
-            .map((c) => Classroom()
-              ..id = c['id']
-              ..name = c['name']
-              ..grade = c['grade'])
-            .toList();
+        final newClassrooms = classroomsList.map((c) {
+          final rawWeeklyOverride = c['weeklyLessonsOverride'];
+          final rawDailyOverride = c['dailyPeriodsOverride'];
+          return Classroom()
+            ..id = c['id']
+            ..name = c['name']
+            ..grade = c['grade']
+            ..weeklyLessonsOverride =
+                rawWeeklyOverride is num ? rawWeeklyOverride.toInt() : null
+            ..dailyPeriodsOverride = rawDailyOverride is List
+                ? rawDailyOverride
+                    .whereType<num>()
+                    .map((e) => e.toInt())
+                    .toList()
+                : null;
+        }).toList();
         await _isar.classrooms.putAll(newClassrooms);
         for (final c in newClassrooms) {
           classroomMap[c.id] = c;
         }
+      }
+
+      // قيود المواد: مقطع اختياري حتى تبقى النسخ القديمة (التي لا تحتويه)
+      // قابلة للاستيراد، فتُترك المجموعة فارغة كما كانت النسخة نفسها.
+      if (data.containsKey('subjectConstraints')) {
+        final List<dynamic> constraintsList = data['subjectConstraints'];
+        final newConstraints = constraintsList
+            .map((c) => SubjectConstraint()
+              ..id = c['id']
+              ..grade = c['grade']
+              ..subjectName = c['subjectName']
+              ..maxPeriodsPerDay = c['maxPeriodsPerDay'])
+            .toList();
+        await _isar.subjectConstraints.putAll(newConstraints);
       }
 
       if (data.containsKey('lessons')) {
@@ -156,7 +207,8 @@ class BackupService {
             .map((l) => Lesson()
               ..id = l['id']
               ..dayIndex = l['dayIndex']
-              ..periodIndex = l['periodIndex'])
+              ..periodIndex = l['periodIndex']
+              ..isPinned = l['isPinned'] == true)
             .toList();
 
         // Map relationships using in-memory maps

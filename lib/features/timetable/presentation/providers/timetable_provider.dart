@@ -3,6 +3,7 @@ import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:isar/isar.dart';
 import 'dart:async';
 import 'dart:isolate';
+import '../../../../core/providers/app_config_provider.dart';
 import '../../../../core/providers/database_provider.dart';
 import '../../../../core/models/teacher.dart';
 import '../../../../core/models/subject.dart';
@@ -20,7 +21,9 @@ import '../../../../core/entities/subject_constraint_entity.dart';
 import '../../domain/usecases/timetable_generator.dart';
 import '../../domain/usecases/smart_auto_fix_usecase.dart';
 import '../providers/timetable_interaction_index.dart';
+import '../providers/timetable_move_validator.dart';
 import '../../../../core/exceptions/timetable_generation_exception.dart';
+import '../../../management/domain/services/lesson_assignment_planner.dart';
 
 part 'timetable_provider.g.dart';
 
@@ -87,6 +90,9 @@ class TimetableNotifier extends _$TimetableNotifier {
 
   @override
   Future<List<Lesson>> build() async {
+    ref.listen(appConfigNotifierProvider, (previous, next) {
+      _interactionIndex = null;
+    });
     final isar = await ref.watch(isarDatabaseProvider.future);
     _startReferenceWatchers(isar);
     return _loadPersistedLessons(isar, force: true);
@@ -201,9 +207,16 @@ class TimetableNotifier extends _$TimetableNotifier {
     }
 
     final constraints = await _loadSubjectConstraints(isar);
+    final appConfig = await ref.read(appConfigNotifierProvider.future);
+    final settingsList = await isar.appSettings.where().findAll();
+    final settings = settingsList.isNotEmpty
+        ? settingsList.first
+        : (AppSettings()..periodsPerDay = 7);
     final index = TimetableInteractionIndex.build(
       lessons: visibleLessons,
       subjectConstraints: constraints,
+      appConfig: appConfig,
+      daysPerWeek: settings.daysPerWeek,
     );
     _interactionIndex = index;
     return index;
@@ -256,66 +269,13 @@ class TimetableNotifier extends _$TimetableNotifier {
     required Set<int> excludedLessonIds,
     required String operationLabel,
   }) {
-    final teacher = lesson.teacher.value;
-    final subject = lesson.subject.value;
-    final classroom = lesson.classroom.value;
-
-    if (index.hasTeacherConflict(
-      teacherId: teacher?.id,
-      dayIndex: newDay,
-      periodIndex: newPeriod,
+    return TimetableMoveValidator(index).validatePlacement(
+      lesson: lesson,
+      newDay: newDay,
+      newPeriod: newPeriod,
       excludedLessonIds: excludedLessonIds,
-    )) {
-      return 'لا يمكن $operationLabel: الأستاذ (${teacher?.name ?? ''}) لديه حصة أخرى في نفس الوقت';
-    }
-
-    if (index.hasClassroomConflict(
-      classroomId: classroom?.id,
-      dayIndex: newDay,
-      periodIndex: newPeriod,
-      excludedLessonIds: excludedLessonIds,
-    )) {
-      return 'لا يمكن $operationLabel: الصف مشغول بالفعل في الحصة المقترحة';
-    }
-
-    if (subject != null && classroom != null) {
-      final maxAllowed = index.maxPeriodsPerDay(
-        grade: classroom.grade,
-        subjectName: subject.name,
-      );
-      final subjectCountOnNewDay = index.subjectCountOnDay(
-        classroomId: classroom.id,
-        subjectId: subject.id,
-        dayIndex: newDay,
-        excludedLessonIds: excludedLessonIds,
-      );
-      if (subjectCountOnNewDay >= maxAllowed) {
-        return 'لا يمكن $operationLabel: تجاوز الحد الأقصى ($maxAllowed حصص) لمادة (${subject.name}) في اليوم المقترح';
-      }
-    }
-
-    if (lesson.dayIndex != newDay && teacher != null) {
-      final teacherLessonsNewDay = index.teacherCountOnDay(
-        teacherId: teacher.id,
-        dayIndex: newDay,
-        excludedLessonIds: excludedLessonIds,
-      );
-      if (teacherLessonsNewDay >= teacher.maxLessonsPerDay) {
-        return 'لا يمكن $operationLabel: تجاوز الحد الأقصى للحصص اليومية للأستاذ (${teacher.name})';
-      }
-    }
-
-    if (teacher?.unavailableDays.contains(newDay) ?? false) {
-      return 'لا يمكن $operationLabel: الأستاذ مفرغ في اليوم المقترح ولا يمكن وضع حصة له';
-    }
-
-    if (subject != null &&
-        subject.allowedPeriods.isNotEmpty &&
-        !subject.allowedPeriods.contains(newPeriod)) {
-      return 'لا يمكن $operationLabel: المادة غير مسموح بتدريسها في الحصة (${newPeriod + 1}) بناءً على إعداداتها';
-    }
-
-    return null;
+      operationLabel: operationLabel,
+    );
   }
 
   bool get isDragDropOperationInProgress => _dragDropOperationInProgress;
@@ -337,64 +297,29 @@ class TimetableNotifier extends _$TimetableNotifier {
     final isar = await ref.read(isarDatabaseProvider.future);
 
     final allLessons = await isar.lessons.where().findAll();
-
-    // Check duplicate assignment
-    bool duplicateAssignment = allLessons.any((l) =>
-        l.classroom.value?.id == classroom.id &&
-        l.subject.value?.id == subject.id);
-
-    if (duplicateAssignment) {
-      return (false, "تم إسناد هذه المادة لهذا الصف مسبقاً");
-    }
-
-    // Check real-time classroom capacity overload
     final settingsList = await isar.appSettings.where().findAll();
     final settings = settingsList.isNotEmpty
         ? settingsList.first
         : (AppSettings()..periodsPerDay = 7);
-    int maxClassroomCapacity = settings.periodsPerDay * settings.daysPerWeek;
+    final appConfig = await ref.read(appConfigNotifierProvider.future);
 
-    int classAssignedLessons =
-        allLessons.where((l) => l.classroom.value?.id == classroom.id).length;
-    int proposedClassTotal = classAssignedLessons + subject.lessonsPerWeek;
-
-    if (proposedClassTotal > maxClassroomCapacity) {
-      return (
-        false,
-        "تحذير: لا يمكن الإسناد. الصف ${classroom.name} سيصل إلى $proposedClassTotal حصة، مما يتجاوز السعة القصوى للجدول الأسبوعي ($maxClassroomCapacity حصة)."
-      );
+    final plan = LessonAssignmentPlanner.plan(
+      teacher: teacher,
+      subjects: [subject],
+      classrooms: [classroom],
+      existingLessons: allLessons,
+      settings: settings,
+      appConfig: appConfig,
+      duplicateBehavior: DuplicateAssignmentBehavior.fail,
+    );
+    if (!plan.isSuccess) {
+      return (false, plan.errorMessage);
     }
 
-    // Check real-time teacher capacity overload
-    int teacherAssignedLessons =
-        allLessons.where((l) => l.teacher.value?.id == teacher.id).length;
-    int proposedTeacherTotal = teacherAssignedLessons + subject.lessonsPerWeek;
-
-    int activeUnavailableDays = teacher.unavailableDays
-        .where((day) => day < settings.daysPerWeek)
-        .length;
-    int availableDays = settings.daysPerWeek - activeUnavailableDays;
-
-    int maxCapacityDays = teacher.maxLessonsPerDay * availableDays;
-    int absoluteMaxCapacity = teacher.maxLessonsPerWeek < maxCapacityDays
-        ? teacher.maxLessonsPerWeek
-        : maxCapacityDays;
-
-    if (proposedTeacherTotal > absoluteMaxCapacity) {
-      return (
-        false,
-        "تحذير: لا يمكن إسناد هذه المادة. المعلم ${teacher.name} سيصل إلى $proposedTeacherTotal حصة، مما يتجاوز حده المسموح ($absoluteMaxCapacity حصة). يرجى اختيار معلم آخر."
-      );
-    }
-
-    final newLessons = <Lesson>[];
-    for (int i = 0; i < subject.lessonsPerWeek; i++) {
-      final lesson = Lesson()
-        ..classroom.value = classroom
-        ..subject.value = subject
-        ..teacher.value = teacher;
-      newLessons.add(lesson);
-    }
+    final newLessons = LessonAssignmentPlanner.buildPoolLessons(
+      teacher: teacher,
+      pairs: plan.pairsToCreate,
+    );
 
     isar.writeTxnSync(() {
       isar.lessons.putAllSync(newLessons);
@@ -472,6 +397,7 @@ class TimetableNotifier extends _$TimetableNotifier {
       final settings = settingsList.isNotEmpty
           ? settingsList.first
           : (AppSettings()..periodsPerDay = 7);
+      final appConfig = await ref.read(appConfigNotifierProvider.future);
 
       // Clear existing schedule assignments by resetting indexes
       final existingLessons = await isar.lessons.where().findAll();
@@ -484,7 +410,14 @@ class TimetableNotifier extends _$TimetableNotifier {
         for (var s in subjects) s.id: SubjectEntity.fromIsar(s)
       };
       final classroomsMap = {
-        for (var c in classrooms) c.id: ClassroomEntity.fromIsar(c)
+        for (var c in classrooms)
+          c.id: ClassroomEntity.fromIsar(
+            c,
+            effectiveConfig: appConfig.resolveWeeklyConfigForClassroom(
+              c,
+              daysPerWeek: settings.daysPerWeek,
+            ),
+          )
       };
 
       final existingLessonsEntity = existingLessons
@@ -782,6 +715,16 @@ class TimetableNotifier extends _$TimetableNotifier {
       return (false, validationError);
     }
 
+    final groupError = TimetableMoveValidator(index).validateGroupRules(
+      moves: {
+        currentLesson.id: (dayIndex: newDay, periodIndex: newPeriod),
+      },
+      operationLabel: 'النقل',
+    );
+    if (groupError != null) {
+      return (false, groupError);
+    }
+
     index.moveLesson(
       lessonId: currentLesson.id,
       newDay: newDay,
@@ -860,6 +803,23 @@ class TimetableNotifier extends _$TimetableNotifier {
     );
     if (secondValidationError != null) {
       return (false, secondValidationError);
+    }
+
+    final groupError = TimetableMoveValidator(index).validateGroupRules(
+      moves: {
+        currentLesson1.id: (
+          dayIndex: currentLesson2.dayIndex!,
+          periodIndex: currentLesson2.periodIndex!,
+        ),
+        currentLesson2.id: (
+          dayIndex: currentLesson1.dayIndex!,
+          periodIndex: currentLesson1.periodIndex!,
+        ),
+      },
+      operationLabel: 'التبديل',
+    );
+    if (groupError != null) {
+      return (false, groupError);
     }
 
     final firstDay = currentLesson1.dayIndex;

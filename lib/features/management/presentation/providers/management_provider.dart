@@ -1,5 +1,6 @@
 import 'package:isar/isar.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
+import '../../../../core/providers/app_config_provider.dart';
 import '../../../../core/providers/database_provider.dart';
 import '../../../../core/providers/repository_provider.dart';
 import '../../../../core/models/teacher.dart';
@@ -7,7 +8,9 @@ import '../../../../core/models/subject.dart';
 import '../../../../core/models/subject_consecutiveness.dart';
 import '../../../../core/models/subject_constraint.dart';
 import '../../../../core/models/classroom.dart';
+import '../../../../core/models/lesson.dart';
 import '../../../../core/models/settings.dart';
+import '../../domain/services/lesson_assignment_planner.dart';
 
 part 'management_provider.g.dart';
 
@@ -23,6 +26,71 @@ class TeachersNotifier extends _$TeachersNotifier {
     final repo = await ref.read(managementRepositoryProvider.future);
     await repo.addTeacher(teacher);
     state = AsyncValue.data(await repo.getTeachers());
+  }
+
+  /// ينشئ المعلم وإسناداته الأولية (مادة×صف) في معاملة Isar واحدة.
+  ///
+  /// يعيد `null` عند النجاح، أو رسالة خطأ عربية دون كتابة أي بيانات.
+  Future<String?> addTeacherWithInitialAssignments({
+    required Teacher teacher,
+    required List<Subject> subjects,
+    required List<Classroom> classrooms,
+  }) async {
+    final isar = await ref.read(isarDatabaseProvider.future);
+    final existingLessons = await isar.lessons.where().findAll();
+    for (final lesson in existingLessons) {
+      if (lesson.classroom.value == null) {
+        await lesson.classroom.load();
+      }
+      if (lesson.subject.value == null) {
+        await lesson.subject.load();
+      }
+      if (lesson.teacher.value == null) {
+        await lesson.teacher.load();
+      }
+    }
+
+    final storedSettings = await isar.appSettings.where().findFirst();
+    final settings = storedSettings ?? (AppSettings()..periodsPerDay = 7);
+    final appConfig = await ref.read(appConfigNotifierProvider.future);
+
+    final plan = LessonAssignmentPlanner.plan(
+      teacher: teacher,
+      subjects: subjects,
+      classrooms: classrooms,
+      existingLessons: existingLessons,
+      settings: settings,
+      appConfig: appConfig,
+      duplicateBehavior: DuplicateAssignmentBehavior.skip,
+    );
+    if (!plan.isSuccess) {
+      return plan.errorMessage;
+    }
+
+    final newLessons = LessonAssignmentPlanner.buildPoolLessons(
+      teacher: teacher,
+      pairs: plan.pairsToCreate,
+    );
+
+    try {
+      await isar.writeTxn(() async {
+        await isar.teachers.put(teacher);
+        if (newLessons.isNotEmpty) {
+          await isar.lessons.putAll(newLessons);
+          for (final lesson in newLessons) {
+            await lesson.teacher.save();
+            await lesson.subject.save();
+            await lesson.classroom.save();
+          }
+        }
+      });
+    } catch (error) {
+      return 'تعذر حفظ المعلم والإسنادات الأولية: $error';
+    }
+
+    final repo = await ref.read(managementRepositoryProvider.future);
+    state = AsyncValue.data(await repo.getTeachers());
+    return null;
   }
 
   Future<void> deleteTeacher(int id) async {
@@ -72,7 +140,23 @@ class SubjectsNotifier extends _$SubjectsNotifier {
         ..grade = grade
         ..subjectName = subjectName
         ..maxPeriodsPerDay = maxPeriodsPerDay;
-      await isar.subjectConstraints.put(constraint);
+      final savedId = await isar.subjectConstraints.put(constraint);
+
+      // نقل قيد إلى (صف، مادة) لها قيد مسبقًا يجعل القيد المنقول هو قيدها
+      // الوحيد؛ وإلا بقي سجلّان للمفتاح نفسه فيأخذ المحرك أحدهما والسحب الآخر.
+      final sameKey = await isar.subjectConstraints
+          .filter()
+          .gradeEqualTo(grade)
+          .and()
+          .subjectNameEqualTo(subjectName)
+          .findAll();
+      final duplicateIds = [
+        for (final other in sameKey)
+          if (other.id != savedId) other.id,
+      ];
+      if (duplicateIds.isNotEmpty) {
+        await isar.subjectConstraints.deleteAll(duplicateIds);
+      }
 
       final subject =
           await isar.subjects.filter().nameEqualTo(subjectName).findFirst();
@@ -120,12 +204,14 @@ class SettingsNotifier extends _$SettingsNotifier {
   Future<AppSettings> build() async {
     final repo = await ref.watch(managementRepositoryProvider.future);
     final settings = await repo.getSettings();
-    return settings ?? AppSettings();
+    return settings ?? (AppSettings()..periodsPerDay = 7);
   }
 
   Future<void> saveSettings(AppSettings settings) async {
     final repo = await ref.read(managementRepositoryProvider.future);
     await repo.saveSettings(settings);
-    state = AsyncValue.data(await repo.getSettings() ?? AppSettings());
+    state = AsyncValue.data(
+      await repo.getSettings() ?? (AppSettings()..periodsPerDay = 7),
+    );
   }
 }

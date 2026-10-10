@@ -57,6 +57,10 @@ class ConflictMessageMapper {
       return 'مادة "${reason.subjectName}": غير مسموح بتدريسها في الحصة ${reason.period + 1}.';
     } else if (reason is NonConsecutiveSubjectPeriodsConflict) {
       return 'مادة "${reason.subjectName}" (الفصل "${reason.classroomName}"): الحصص غير متتالية في اليوم ${reason.day + 1}.';
+    } else if (reason is AdjacentSubjectPeriodsConflict) {
+      return 'مادة "${reason.subjectName}" (الفصل "${reason.classroomName}"): حصتان متجاورتان في اليوم ${reason.day + 1} والمادة مضبوطة على «غير متتالي».';
+    } else if (reason is SubjectDailyDistributionConflict) {
+      return 'مادة "${reason.subjectName}" (الفصل "${reason.classroomName}"): اليوم ${reason.day + 1} فيه ${reason.currentCount} حصة والمطلوب ${reason.minRequired} على الأقل لتوزيع حصص المادة على أيام الأسبوع.';
     }
     return 'سبب غير معروف للصراع.';
   }
@@ -809,8 +813,14 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
       }
     }
 
-    final days = ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'];
-    final displayDays = days.take(settings.daysPerWeek).toList();
+    final displayDays = timetableDayLabels(settings.daysPerWeek);
+    var effectivePeriodsPerDay = settings.periodsPerDay;
+    for (final lesson in assigned) {
+      final p = lesson.periodIndex;
+      if (p != null && p + 1 > effectivePeriodsPerDay) {
+        effectivePeriodsPerDay = p + 1;
+      }
+    }
 
     List<TableRow> rows = [];
 
@@ -872,7 +882,7 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
         children: headerCells));
 
     for (int d = 0; d < displayDays.length; d++) {
-      for (int p = 0; p < settings.periodsPerDay; p++) {
+      for (int p = 0; p < effectivePeriodsPerDay; p++) {
         List<Widget> cells = [];
 
         if (p == 0) {
@@ -1146,8 +1156,14 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
       return const Center(child: Text('لا يوجد بيانات لعرضها.'));
     }
 
-    final days = ['الأحد', 'الإثنين', 'الثلاثاء', 'الأربعاء', 'الخميس'];
-    final displayDays = days.take(settings.daysPerWeek).toList();
+    final displayDays = timetableDayLabels(settings.daysPerWeek);
+    var effectivePeriodsPerDay = settings.periodsPerDay;
+    for (final lesson in assigned) {
+      final p = lesson.periodIndex;
+      if (p != null && p + 1 > effectivePeriodsPerDay) {
+        effectivePeriodsPerDay = p + 1;
+      }
+    }
     final int masterKeyId = 0; // use 0 for the master grid
     if (!_classroomKeys.containsKey(masterKeyId)) {
       _classroomKeys[masterKeyId] = GlobalKey();
@@ -1207,7 +1223,7 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
         children: headerCells));
 
     for (int d = 0; d < displayDays.length; d++) {
-      for (int p = 0; p < settings.periodsPerDay; p++) {
+      for (int p = 0; p < effectivePeriodsPerDay; p++) {
         List<Widget> cells = [];
 
         if (p == 0) {
