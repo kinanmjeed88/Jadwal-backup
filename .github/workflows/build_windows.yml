@@ -7,11 +7,13 @@ on:
       - main
       - master
       - 'release/**'
+      - 'برنامج-مخصص-لوندوز-١٠-و-١١'
   push:
     branches:
       - main
       - master
       - 'release/**'
+      - 'برنامج-مخصص-لوندوز-١٠-و-١١'
 
 jobs:
   build:
@@ -35,7 +37,19 @@ jobs:
         run: flutter pub get
 
       - name: Analyze Dart and Flutter Sources
-        run: flutter analyze --no-fatal-infos
+        shell: pwsh
+        run: |
+          $out = flutter analyze --no-fatal-infos 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            $errors = ($out | Where-Object { $_ -match 'error -|warning -' }) -join " | "
+            if ([string]::IsNullOrWhiteSpace($errors)) {
+              $errors = ($out | Select-Object -Last 15) -join " | "
+            }
+            Write-Host "::error title=FlutterAnalyze::$errors"
+            exit $code
+          }
 
       - name: Run Flutter Tests
         shell: pwsh
@@ -43,10 +57,30 @@ jobs:
           $testFiles = Get-ChildItem -Path test -Recurse -Filter '*_test.dart' |
             Where-Object { $_.Name -ne 'backup_service_benchmark_test.dart' } |
             ForEach-Object { $_.FullName }
-          flutter test @testFiles
+          $out = flutter test --machine @testFiles 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          $events = @($out | ForEach-Object {
+            try { $_.ToString() | ConvertFrom-Json -ErrorAction Stop } catch { }
+          })
+          $completed = @($events | Where-Object {
+            $_.type -eq 'testDone' -and -not $_.hidden -and -not $_.skipped
+          })
+          $passed = @($completed | Where-Object { $_.result -eq 'success' }).Count
+          $failed = @($completed | Where-Object { $_.result -ne 'success' }).Count
+          $skipped = @($events | Where-Object {
+            $_.type -eq 'testDone' -and $_.skipped -and -not $_.hidden
+          }).Count
+          Write-Host ('::warning title=Executed test results::Passed={0}; Failed={1}; Skipped={2}' -f $passed, $failed, $skipped)
+          if ($passed -eq 0) { throw 'No completed tests recorded' }
+          if ($code -ne 0) {
+            $failLines = ($out | Where-Object { $_ -match 'Exception|Error|Expected|Actual|failed|══' } | Select-Object -First 25) -join " | "
+            Write-Host "::error title=FlutterTest::$failLines"
+            exit $code
+          }
 
       - name: Build Windows Release
-        run: flutter build windows --release
+        run: flutter build windows --release --target=lib/main_windows.dart
 
       - name: Read Application Version
         id: version
@@ -62,7 +96,7 @@ jobs:
         shell: pwsh
         run: |
           $releaseDir = 'build\windows\x64\runner\Release'
-          $executable = Join-Path $releaseDir 'jadwal_v2.exe'
+          $executable = Join-Path $releaseDir 'JadwalV2_Windows10_11.exe'
           $dataDir = Join-Path $releaseDir 'data'
           if (-not (Test-Path $executable)) { throw "Missing executable: $executable" }
           if (-not (Test-Path $dataDir)) { throw "Missing Flutter data directory: $dataDir" }
@@ -72,7 +106,7 @@ jobs:
         timeout-minutes: 2
         run: >-
           pwsh -File windows\\packaging\\smoke_test.ps1
-          -ExecutablePath build\\windows\\x64\\runner\\Release\\jadwal_v2.exe
+          -ExecutablePath build\\windows\\x64\\runner\\Release\\JadwalV2_Windows10_11.exe
 
       - name: Prepare temporary Windows signing configuration
         id: signing_config
@@ -99,7 +133,7 @@ jobs:
         run: >-
           pwsh -File windows\\packaging\\sign_windows.ps1
           -ConfigurationPath "${{ steps.signing_config.outputs.config_path }}"
-          -Path build\\windows\\x64\\runner\\Release\\jadwal_v2.exe
+          -Path build\\windows\\x64\\runner\\Release\\JadwalV2_Windows10_11.exe
 
       - name: Install Inno Setup
         shell: pwsh
@@ -112,7 +146,7 @@ jobs:
           $releaseDir = Resolve-Path 'build\windows\x64\runner\Release'
           $distDir = Join-Path (Get-Location) 'dist'
           New-Item -ItemType Directory -Force -Path $distDir | Out-Null
-          Compress-Archive -Path (Join-Path $releaseDir '*') -DestinationPath (Join-Path $distDir "Jadwal-V2-Windows-$version.zip") -Force
+          Compress-Archive -Path (Join-Path $releaseDir '*') -DestinationPath (Join-Path $distDir "Jadwal-V2-Windows-10-11-$version.zip") -Force
           $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
           if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found: $iscc" }
           & $iscc "/DAppVersion=$version" "/DSourceDir=$releaseDir" "/DOutputDir=$distDir" 'windows\packaging\jadwal_v2.iss'
@@ -124,24 +158,37 @@ jobs:
         run: >-
           pwsh -File windows\\packaging\\sign_windows.ps1
           -ConfigurationPath "${{ steps.signing_config.outputs.config_path }}"
-          -Path dist\\Jadwal-V2-Windows-${{ steps.version.outputs.version }}-Setup.exe
+          -Path dist\\Jadwal-V2-Windows-10-11-${{ steps.version.outputs.version }}-Setup.exe
 
       - name: Archive Windows Release Bundle
         uses: actions/upload-artifact@v4
         with:
-          name: Jadwal-Windows-Release-${{ steps.version.outputs.version }}
+          name: Jadwal-Windows-10-11-Release-${{ steps.version.outputs.version }}
           path: build\\windows\\x64\\runner\\Release\\*
           retention-days: 7
 
       - name: Upload Windows ZIP and Installer
         uses: actions/upload-artifact@v4
         with:
-          name: Jadwal-Windows-Distributables-${{ steps.version.outputs.version }}
+          name: Jadwal-Windows-10-11-Distributables-${{ steps.version.outputs.version }}
           path: |
             dist\*.zip
             dist\*.exe
           if-no-files-found: error
           retention-days: 30
+
+      - name: Write GitHub Actions artifact summary
+        shell: pwsh
+        run: >-
+          pwsh -File windows\\packaging\\write_artifact_summary.ps1
+          -PlatformLabel "Windows 10 / Windows 11"
+          -ReleaseDir "build\\windows\\x64\\runner\\Release"
+          -DistDir "dist"
+          -ReleaseArtifactName "Jadwal-Windows-10-11-Release-${{ steps.version.outputs.version }}"
+          -DistributablesArtifactName "Jadwal-Windows-10-11-Distributables-${{ steps.version.outputs.version }}"
+          -ReleaseRetentionDays 7
+          -DistributablesRetentionDays 30
+          -CommitSha "${{ github.sha }}"
 
       - name: Remove temporary Windows signing configuration
         if: always()
