@@ -4,7 +4,7 @@ on:
   push:
     branches: [ "main", "master", "arena/**" ]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: [ "searchidf", "main", "master" ]
   workflow_dispatch:
 
 jobs:
@@ -29,6 +29,12 @@ jobs:
 
     - name: Get Dependencies
       run: flutter pub get
+
+    - name: Analyze Dart and Flutter Sources
+      run: flutter analyze --no-fatal-infos
+
+    - name: Run Flutter Tests
+      run: flutter test
 
     - name: Server-Side Android Fix
       run: |
