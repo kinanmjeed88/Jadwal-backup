@@ -18,6 +18,7 @@ import '../../../../core/models/settings.dart';
 import '../../../../core/models/weekly_load_policy.dart';
 import '../../../../core/providers/app_backup_provider.dart';
 import '../../../../core/providers/app_config_provider.dart';
+import '../../../../core/services/file_save_service.dart';
 import '../../../setup/presentation/pages/first_run_setup_page.dart';
 import '../../../setup/presentation/widgets/school_stage_selector.dart';
 import '../../../setup/presentation/widgets/weekly_load_mode_selector.dart';
@@ -232,18 +233,27 @@ class _SettingsFormState extends ConsumerState<_SettingsForm> {
           Uint8List.fromList(const Utf8Encoder().convert(jsonStr));
 
       if (Platform.isWindows) {
-        final savedPath = await FilePicker.platform.saveFile(
-          dialogTitle: 'حفظ النسخة الاحتياطية',
-          fileName: 'jadwal_backup.json',
-          type: FileType.custom,
-          allowedExtensions: ['json'],
-          bytes: jsonBytes,
-          lockParentWindow: true,
-        );
+        final outcome = await ref.read(fileSaveServiceProvider).saveBytes(
+              dialogTitle: 'حفظ النسخة الاحتياطية',
+              fileName: 'jadwal_backup.json',
+              allowedExtensions: ['json'],
+              bytes: jsonBytes,
+            );
 
-        if (mounted && savedPath != null) {
+        if (!mounted) return;
+        if (outcome is FileSaved) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('تم حفظ النسخة الاحتياطية بنجاح')),
+            SnackBar(
+                content: Text(
+                    'تم حفظ النسخة الاحتياطية بنجاح: ${outcome.path}')),
+          );
+        } else if (outcome is FileSaveFailed) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content:
+                  Text('فشل في حفظ النسخة الاحتياطية: ${outcome.error}'),
+              backgroundColor: Colors.red,
+            ),
           );
         }
         return;
