@@ -164,27 +164,26 @@ jobs:
         KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
       run: |
         set -uo pipefail
+        # المستودع يتجاهل gradlew/gradle-wrapper.jar، فنولّد غلاف المشروع (8.14 حسب
+        # gradle-wrapper.properties) بدل Gradle المثبّت على العدّاء (9.x) غير المتوافق مع AGP 8.6.
         cd android
-        # المستودع يتجاهل gradlew/gradle-wrapper.jar في .gitignore، لذا نستخدم
-        # الغلاف إن وُجد وإلا Gradle المثبّت على العدّاء.
-        if [ -x ./gradlew ]; then
-          GRADLE_CMD=./gradlew
-        elif command -v gradle >/dev/null 2>&1; then
-          GRADLE_CMD=gradle
-        else
-          echo "⚠️ لا gradlew ولا gradle متاح — تخطّي الفحص المسبق."
-          exit 0
+        if [ ! -x ./gradlew ]; then
+          if command -v gradle >/dev/null 2>&1; then
+            gradle wrapper --no-daemon               --gradle-version "$(sed -nE 's#.*gradle-([0-9.]+)-all\.zip.*#\1#p' gradle/wrapper/gradle-wrapper.properties | head -n1)"               > ../gradle-wrapper-gen.log 2>&1 || { echo "⚠️ تعذّر توليد غلاف Gradle — تخطّي الفحص المسبق."; exit 0; }
+          else
+            echo "⚠️ لا gradlew ولا gradle — تخطّي الفحص المسبق."
+            exit 0
+          fi
         fi
-        echo "الفحص المسبق عبر: $GRADLE_CMD"
-        if ! "$GRADLE_CMD" :app:help --no-daemon > ../gradle-preflight.log 2>&1; then
+        if ! ./gradlew :app:help --no-daemon > ../gradle-preflight.log 2>&1; then
           {
             echo "## ❌ فشل إعداد Gradle لوضع release"
             echo
             echo '```'
-            tail -n 90 ../gradle-preflight.log
+            awk '/^\* What went wrong/{f=1} f' ../gradle-preflight.log | head -n 60
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          tail -n 90 ../gradle-preflight.log
+          awk '/^\* What went wrong/{f=1} f' ../gradle-preflight.log | head -n 60
           exit 1
         fi
         echo "✅ إعداد Gradle لوضع release سليم."
@@ -204,10 +203,10 @@ jobs:
             echo "## ❌ فشل بناء إصدار Android الموقّع"
             echo
             echo '```'
-            tail -n 120 build-release.log
+            awk '/^\* What went wrong/{f=1} f' build-release.log | head -n 80
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          tail -n 120 build-release.log
+          awk '/^\* What went wrong/{f=1} f' build-release.log | head -n 80
           exit 1
         fi
         tail -n 40 build-release.log
@@ -340,7 +339,9 @@ jobs:
               echo "## $f"
               echo
               printf '%s\n' "$fence"
-              tail -n 120 "$f"
+              # قسم الخطأ الفعلي إن وُجد، وإلا ذيل السجل كاملاً.
+              awk '/^\* What went wrong/{f=1} f' "$f" | head -n 120
+              tail -n 25 "$f"
               printf '%s\n' "$fence"
             } >> "$diag"
           fi
