@@ -10,10 +10,6 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      # مطلوبة مؤقتاً لخطوة التشخيص التي تنشر سجل الفشل كـ Issue.
-      issues: write
     steps:
     - uses: actions/checkout@v4
 
@@ -320,31 +316,3 @@ jobs:
       if: always()
       run: rm -f "$RUNNER_TEMP/upload-keystore.jks" "$RUNNER_TEMP/apksigner.txt"
 
-    # ⚠️ خطوة تشخيص مؤقتة: تنشر ذيل سجل الفشل كـ Issue لأن نطاق تخزين سجلات
-    # Actions غير متاح من بيئة الفحص الحالية. تُحذف بعد تشخيص فشل البناء.
-    - name: DIAG Publish Failure Log
-      if: failure()
-      env:
-        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      run: |
-        set -uo pipefail
-        diag="$RUNNER_TEMP/diag-body.md"
-        : > "$diag"
-        echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> "$diag"
-        fence='```'
-        for f in gradle-preflight.log build-release.log; do
-          if [ -f "$f" ]; then
-            {
-              echo
-              echo "## $f"
-              echo
-              printf '%s\n' "$fence"
-              # قسم الخطأ الفعلي إن وُجد، وإلا ذيل السجل كاملاً.
-              awk '/^\* What went wrong/{f=1} f' "$f" | head -n 120
-              tail -n 25 "$f"
-              printf '%s\n' "$fence"
-            } >> "$diag"
-          fi
-        done
-        gh issue create --title "[DIAG] فشل بناء Android الموقّع ${GITHUB_RUN_ID}" --body-file "$diag" \
-          || { echo "تعذّر إنشاء issue للتشخيص:"; head -c 400 "$diag"; }
