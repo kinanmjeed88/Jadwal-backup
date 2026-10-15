@@ -163,7 +163,7 @@ jobs:
     - name: Verify APK Signer Matches Official Keystore
       if: steps.signing.outputs.available == 'true' && steps.keystore.outputs.keystore_path != ''
       env:
-        EXPECTED_SHA256: ${{ steps.Decode and Validate Official Keystore.outputs.signing_sha256 }}
+        EXPECTED_SHA256: ${{ steps.keystore.outputs.signing_sha256 }}
       run: |
         set -euo pipefail
         apk="build/app/outputs/flutter-apk/app-release.apk"
