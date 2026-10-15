@@ -149,6 +149,31 @@ jobs:
           echo "signing_sha256=$fingerprint"
         } >> "$GITHUB_OUTPUT"
 
+    # تشخيص مبكر ورخيص: يمر بمرحلة إعداد Gradle (تجميع build.gradle.kts وتقييم
+    # كتلة التوقيع) دون بناء كامل. أي خطأ هنا يظهر مباشرة في ملخّص التشغيل.
+    - name: Preflight Gradle Release Configuration
+      if: steps.signing.outputs.available == 'true' && steps.keystore.outputs.keystore_path != ''
+      env:
+        STORE_FILE: ${{ runner.temp }}/upload-keystore.jks
+        STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      run: |
+        set -uo pipefail
+        cd android
+        if ! ./gradlew :app:help --no-daemon > ../gradle-preflight.log 2>&1; then
+          {
+            echo "## ❌ فشل إعداد Gradle لوضع release"
+            echo
+            echo '```'
+            tail -n 90 ../gradle-preflight.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          tail -n 90 ../gradle-preflight.log
+          exit 1
+        fi
+        echo "✅ إعداد Gradle لوضع release سليم."
+
     # يحتفظ الإنتاج بمسار Release الموقّع عند توفر الأسرار.
     - name: Build Signed Android Release
       if: steps.signing.outputs.available == 'true' && steps.keystore.outputs.keystore_path != ''
@@ -157,7 +182,20 @@ jobs:
         STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
         KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-      run: flutter build apk --release --android-skip-build-dependency-validation
+      run: |
+        set -uo pipefail
+        if ! flutter build apk --release --android-skip-build-dependency-validation > build-release.log 2>&1; then
+          {
+            echo "## ❌ فشل بناء إصدار Android الموقّع"
+            echo
+            echo '```'
+            tail -n 120 build-release.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          tail -n 120 build-release.log
+          exit 1
+        fi
+        tail -n 40 build-release.log
 
     # إثبات أن الـ APK الناتج موقّع فعلاً بالشهادة الرسمية نفسها (v1/v2/v3).
     - name: Verify APK Signer Matches Official Keystore
