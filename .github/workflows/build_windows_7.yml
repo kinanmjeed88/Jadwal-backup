@@ -37,13 +37,13 @@ jobs:
       - name: Verify Flutter and Dart Versions
         shell: pwsh
         run: |
-          $version = flutter --version --machine | ConvertFrom-Json
-          Write-Host "Flutter=$($version.frameworkVersion); Dart=$($version.dartSdkVersion)"
-          if ($version.frameworkVersion -ne '3.16.9') {
-            throw "Expected Flutter 3.16.9, got $($version.frameworkVersion)"
+          $text = (flutter --version 2>&1) -join "`n"
+          Write-Host $text
+          if ($text -notmatch 'Flutter 3\.16\.9') {
+            throw "Expected Flutter 3.16.9. Full version output: $text"
           }
-          if (-not $version.dartSdkVersion.StartsWith('3.2.6')) {
-            throw "Expected Dart 3.2.6, got $($version.dartSdkVersion)"
+          if ($text -notmatch 'Dart 3\.2\.6') {
+            throw "Expected Dart 3.2.6. Full version output: $text"
           }
 
       - name: Verify Manifest Policy
