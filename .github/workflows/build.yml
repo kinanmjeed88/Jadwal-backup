@@ -51,40 +51,200 @@ jobs:
     - name: Generate App Icons
       run: flutter pub run flutter_launcher_icons
 
-    # لا تُقرأ بيانات التوقيع ولا تُكتب إلا عندما تكون الأسرار الأربعة متوفرة.
-    - name: Detect Android Signing Configuration
+    # ── بوابة التوقيع الإلزامية ────────────────────────────────────────────────
+    # القاعدة: لا يُبنى APK إصدار (release) إلا بالتوقيع الرسمي المحدد في الأسرار.
+    # الاستثناء الوحيد: بناء تحقّق debug غير موقّع لطلبات الدمج القادمة من fork
+    # (GitHub لا يمرر الأسرار إليها)، ويكون موسوماً بوضوح أنه ليس إصداراً.
+    - name: Enforce Official Signing Policy
       id: signing
       env:
+        EVENT_NAME: ${{ github.event_name }}
+        IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         STORE_FILE_BASE64: ${{ secrets.STORE_FILE_BASE64 }}
         STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
         KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
       run: |
-        if [ -n "$STORE_FILE_BASE64" ] && [ -n "$STORE_PASSWORD" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASSWORD" ]; then
-          echo "available=true" >> "$GITHUB_OUTPUT"
-        else
-          echo "available=false" >> "$GITHUB_OUTPUT"
+        set -euo pipefail
+        missing=""
+        [ -n "$STORE_FILE_BASE64" ] || missing="$missing STORE_FILE_BASE64"
+        [ -n "$STORE_PASSWORD" ]    || missing="$missing STORE_PASSWORD"
+        [ -n "$KEY_ALIAS" ]         || missing="$missing KEY_ALIAS"
+        [ -n "$KEY_PASSWORD" ]      || missing="$missing KEY_PASSWORD"
+
+        if [ -z "$missing" ]; then
+          echo "available=true"  >> "$GITHUB_OUTPUT"
+          echo "mode=signed-release" >> "$GITHUB_OUTPUT"
+          echo "✅ الأسرار الأربعة للتوقيع الرسمي متوفرة → سيُبنى إصدار موقّع."
+          exit 0
         fi
 
-    - name: Decode Keystore
+        if [ "$IS_FORK_PR" = "true" ]; then
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          echo "mode=fork-debug-verification" >> "$GITHUB_OUTPUT"
+          echo "⚠️ طلب دمج من fork: الأسرار غير متاحة$missing"
+          echo "→ مسموح ببناء تحقّق debug غير موقّع فقط (ليس إصداراً)."
+          exit 0
+        fi
+
+        echo "❌ البناء مرفوض: توقيع الإصدار الرسمي غير محدد."
+        echo "الأسرار الناقصة:$missing"
+        echo "أضفها في Settings → Secrets and variables → Actions ثم أعد التشغيل."
+        echo "سياسة المستودع: ممنوع إنتاج APK/AAB بغير التوقيع الرسمي المحدد."
+        exit 1
+
+    - name: Decode and Validate Official Keystore
+      id: keystore
       if: steps.signing.outputs.available == 'true'
       env:
         STORE_FILE_BASE64: ${{ secrets.STORE_FILE_BASE64 }}
-      run: printf '%s' "$STORE_FILE_BASE64" | base64 --decode > "$RUNNER_TEMP/upload-keystore.jks"
+        STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        EXPECTED_SIGNING_SHA256: ${{ secrets.EXPECTED_SIGNING_SHA256 }}
+      run: |
+        set -euo pipefail
+        umask 077
+        keystore="$RUNNER_TEMP/upload-keystore.jks"
+        printf '%s' "$STORE_FILE_BASE64" | base64 --decode > "$keystore"
 
-    # يحتفظ الإنتاج بمسار Release الموقّع عند توفر الأسرار.
-    - name: Build Signed Android Release
-      if: steps.signing.outputs.available == 'true'
+        if [ ! -s "$keystore" ]; then
+          echo "❌ مرفوض: فك ترميز STORE_FILE_BASE64 أنتج ملف keystore فارغاً." >&2
+          exit 1
+        fi
+
+        # إثبات أن الملف keystore صالح وأن كلمة المرور والاسم المستعار صحيحان،
+        # واستخراج بصمة SHA-256 الرسمية قبل البناء (بدون طباعة أي سر).
+        listing="$(keytool -list -v -keystore "$keystore" -storepass "$STORE_PASSWORD" -alias "$KEY_ALIAS")"
+        if ! printf '%s' "$listing" | grep -qi "PrivateKeyEntry"; then
+          echo "❌ مرفوض: '$KEY_ALIAS' ليس مفتاحاً خاصاً (PrivateKeyEntry) داخل الـ keystore." >&2
+          exit 1
+        fi
+
+        fingerprint="$(printf '%s' "$listing" \
+          | sed -nE 's/^[[:space:]]*SHA256:[[:space:]]*([0-9A-Fa-f:]+).*/\1/p' | head -n1)"
+        if [ -z "$fingerprint" ]; then
+          echo "❌ مرفوض: تعذّر استخراج بصمة SHA-256 للشهادة الرسمية." >&2
+          exit 1
+        fi
+        echo "✅ بصمة التوقيع الرسمي (SHA-256): $fingerprint"
+
+        # تثبيت اختياري للهوية: إن وُجد EXPECTED_SIGNING_SHA256 يجب أن تتطابق البصمة.
+        if [ -n "${EXPECTED_SIGNING_SHA256:-}" ]; then
+          expected="$(printf '%s' "$EXPECTED_SIGNING_SHA256" | tr -d ' ' | tr 'a-f' 'A-F')"
+          actual="$(printf '%s' "$fingerprint" | tr -d ' ' | tr 'a-f' 'A-F')"
+          if [ "$expected" != "$actual" ]; then
+            echo "❌ مرفوض: بصمة الشهادة لا تطابق التوقيع الرسمي المثبّت." >&2
+            echo "المتوقع: $expected" >&2
+            echo "الفعلي  : $actual" >&2
+            rm -f "$keystore"
+            exit 1
+          fi
+          echo "✅ البصمة مطابقة للتوقيع الرسمي المثبّت."
+        else
+          echo "ℹ️ لم يُضبط EXPECTED_SIGNING_SHA256؛ استُخدمت البصمة المستخرجة كمرجع للتحقق."
+        fi
+
+        {
+          echo "keystore_path=$keystore"
+          echo "signing_sha256=$fingerprint"
+        } >> "$GITHUB_OUTPUT"
+
+    # تشخيص مبكر ورخيص: يمر بمرحلة إعداد Gradle (تجميع build.gradle.kts وتقييم
+    # كتلة التوقيع) دون بناء كامل. أي خطأ هنا يظهر مباشرة في ملخّص التشغيل.
+    - name: Preflight Gradle Release Configuration
+      if: steps.signing.outputs.available == 'true' && steps.keystore.outputs.keystore_path != ''
       env:
         STORE_FILE: ${{ runner.temp }}/upload-keystore.jks
         STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
         KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-      run: flutter build apk --release --android-skip-build-dependency-validation
+      run: |
+        set -uo pipefail
+        # المستودع يتجاهل gradlew/gradle-wrapper.jar، فنولّد غلاف المشروع (8.14 حسب
+        # gradle-wrapper.properties) بدل Gradle المثبّت على العدّاء (9.x) غير المتوافق مع AGP 8.6.
+        cd android
+        if [ ! -x ./gradlew ]; then
+          if command -v gradle >/dev/null 2>&1; then
+            gradle wrapper --no-daemon               --gradle-version "$(sed -nE 's#.*gradle-([0-9.]+)-all\.zip.*#\1#p' gradle/wrapper/gradle-wrapper.properties | head -n1)"               > ../gradle-wrapper-gen.log 2>&1 || { echo "⚠️ تعذّر توليد غلاف Gradle — تخطّي الفحص المسبق."; exit 0; }
+          else
+            echo "⚠️ لا gradlew ولا gradle — تخطّي الفحص المسبق."
+            exit 0
+          fi
+        fi
+        if ! ./gradlew :app:help --no-daemon > ../gradle-preflight.log 2>&1; then
+          {
+            echo "## ❌ فشل إعداد Gradle لوضع release"
+            echo
+            echo '```'
+            awk '/^\* What went wrong/{f=1} f' ../gradle-preflight.log | head -n 60
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          awk '/^\* What went wrong/{f=1} f' ../gradle-preflight.log | head -n 60
+          exit 1
+        fi
+        echo "✅ إعداد Gradle لوضع release سليم."
+
+    # يحتفظ الإنتاج بمسار Release الموقّع عند توفر الأسرار.
+    - name: Build Signed Android Release
+      if: steps.signing.outputs.available == 'true' && steps.keystore.outputs.keystore_path != ''
+      env:
+        STORE_FILE: ${{ runner.temp }}/upload-keystore.jks
+        STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+      run: |
+        set -uo pipefail
+        if ! flutter build apk --release --android-skip-build-dependency-validation > build-release.log 2>&1; then
+          {
+            echo "## ❌ فشل بناء إصدار Android الموقّع"
+            echo
+            echo '```'
+            awk '/^\* What went wrong/{f=1} f' build-release.log | head -n 80
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          awk '/^\* What went wrong/{f=1} f' build-release.log | head -n 80
+          exit 1
+        fi
+        tail -n 40 build-release.log
+
+    # إثبات أن الـ APK الناتج موقّع فعلاً بالشهادة الرسمية نفسها (v1/v2/v3).
+    - name: Verify APK Signer Matches Official Keystore
+      if: steps.signing.outputs.available == 'true' && steps.keystore.outputs.keystore_path != ''
+      env:
+        EXPECTED_SHA256: ${{ steps.keystore.outputs.signing_sha256 }}
+      run: |
+        set -euo pipefail
+        apk="build/app/outputs/flutter-apk/app-release.apk"
+        [ -f "$apk" ] || { echo "❌ لا يوجد APK عند $apk" >&2; exit 1; }
+
+        apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner 2>/dev/null | sort -V | tail -n1 || true)"
+        if [ -z "$apksigner" ]; then
+          echo "❌ مرفوض: تعذّر العثور على apksigner للتحقق من توقيع الإصدار." >&2
+          exit 1
+        fi
+
+        "$apksigner" verify --print-certs --verbose "$apk" | tee "$RUNNER_TEMP/apksigner.txt"
+
+        actual="$(sed -nE 's/.*SHA-256 digest:[[:space:]]*([0-9a-fA-F]+).*/\1/p' "$RUNNER_TEMP/apksigner.txt" | head -n1 | tr -d ':' | tr 'a-f' 'A-F')"
+        expected="$(printf '%s' "$EXPECTED_SHA256" | tr -d ':' | tr 'a-f' 'A-F')"
+        if [ -z "$actual" ]; then
+          echo "❌ مرفوض: لم يُعثر على شهادة SHA-256 داخل الـ APK (غير موقّع؟)." >&2
+          exit 1
+        fi
+        if [ "$actual" != "$expected" ]; then
+          echo "❌ مرفوض: الـ APK موقّع بشهادة لا تطابق التوقيع الرسمي." >&2
+          echo "المتوقع: $expected" >&2
+          echo "الفعلي  : $actual" >&2
+          exit 1
+        fi
+        echo "✅ تحقّق: الـ APK موقّع بالتوقيع الرسمي ($actual)."
 
     # PRs التي لا تتلقى أسرار التوقيع يجب أن تثبت قابلية البناء دون ادعاء Release موقّع.
     - name: Build Android Debug (Unsigned Verification)
       if: steps.signing.outputs.available != 'true'
+      env:
+        # موافقة صريحة على مسار التحقّق غير الموقّع — بدونه يرفض Gradle أي مسار release.
+        JADWAL_ALLOW_UNSIGNED_VERIFICATION: "true"
       run: flutter build apk --debug --android-skip-build-dependency-validation
 
     - name: Upload Signed Release APK
@@ -111,11 +271,13 @@ jobs:
           build_type="Release (signed)"
           artifact="release-apk"
           purpose="Signed production APK built with the repository signing secrets."
+          signer="Official keystore — SHA-256 \`${{ steps.keystore.outputs.signing_sha256 }}\` (verified with apksigner against the same certificate)."
         else
           apk="build/app/outputs/flutter-apk/app-debug.apk"
           build_type="Debug (unsigned verification)"
           artifact="debug-verification-apk"
           purpose="Unsigned CI verification APK; not a production release. Signing secrets were unavailable."
+          signer="None — this artifact must never be distributed as a release."
         fi
         if [ ! -f "$apk" ]; then
           echo "Missing APK at $apk" >&2
@@ -148,3 +310,9 @@ jobs:
           echo
           echo "Inspected file: \`$apk\` (${size} bytes)."
         } >> "$GITHUB_STEP_SUMMARY"
+
+    # تنظيف مادة التوقيع من آلة البناء في كل الأحوال.
+    - name: Destroy Decoded Keystore
+      if: always()
+      run: rm -f "$RUNNER_TEMP/upload-keystore.jks" "$RUNNER_TEMP/apksigner.txt"
+
