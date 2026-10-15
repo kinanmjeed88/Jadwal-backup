@@ -1,0 +1,65 @@
+name: jadwal_v2
+description: "A new Flutter project."
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.3.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  flutter_riverpod: ^2.5.1
+  isar: ^3.1.0+1
+  isar_flutter_libs: ^3.1.0+1
+  path_provider: ^2.1.6
+  pdf: ^3.11.0
+  printing: ^5.11.0
+  uuid: ^4.5.3
+  google_fonts: ^6.1.0
+  riverpod_annotation: ^2.3.5
+  flutter_localizations:
+    sdk: flutter
+  file_picker: ^10.3.10
+  share_plus: ^12.0.2
+  gal: ^2.3.2
+  excel: ^4.0.6
+  url_launcher: ^6.3.2
+  font_awesome_flutter: ^11.0.0
+  firebase_core: ^4.11.0
+  firebase_analytics: ^12.4.3
+  window_manager: ^0.5.2
+  screen_retriever: ^0.2.2
+  path: ^1.9.1
+  equatable: ^2.1.0
+  meta: ^1.17.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+  build_runner: ^2.4.9
+  isar_generator: ^3.1.0+1
+  riverpod_generator: ^2.4.0
+  flutter_launcher_icons: ^0.13.1
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/images/icon_edge.png"
+  adaptive_icon_background: "#004D40"
+
+flutter:
+  uses-material-design: true
+  
+  assets:
+    - assets/images/
+    
+  fonts:
+    - family: Cairo
+      fonts:
+        - asset: assets/fonts/Cairo-Regular.ttf
+    - family: Amiri
+      fonts:
+        - asset: assets/fonts/Amiri-Regular.ttf
