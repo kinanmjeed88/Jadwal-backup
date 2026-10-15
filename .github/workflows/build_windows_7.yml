@@ -8,12 +8,9 @@ on:
       - 'apps/windows_7/**'
       - 'tools/check_windows7_drift.py'
       - '.github/workflows/build_windows_7.yml'
-  push:
-    branches: ['arena/**']
-    paths:
-      - 'apps/windows_7/**'
-      - 'tools/check_windows7_drift.py'
-      - '.github/workflows/build_windows_7.yml'
+
+permissions:
+  contents: write
 
 jobs:
   verify-windows-7:
@@ -26,6 +23,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
 
       - name: Set up Flutter 3.16.9
         uses: subosito/flutter-action@v2
@@ -83,13 +82,20 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-      # The sandbox cannot download Azure-hosted artifacts. Expose this non-secret,
-      # generated lock through the check summary so it can be committed verbatim.
-      - name: Publish Generated Lock for Review
+      - name: Commit Target-Generated Lock Once
+        if: github.event_name == 'pull_request'
         shell: pwsh
         run: |
-          $encoded = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Resolve-Path 'pubspec.lock')))
-          "LOCKFILE_BASE64_BEGIN`n$encoded`nLOCKFILE_BASE64_END" >> $env:GITHUB_STEP_SUMMARY
+          $tracked = git ls-files --error-unmatch pubspec.lock 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host 'Target-generated lock is already tracked.'
+            exit 0
+          }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add pubspec.lock
+          git commit -m 'build(windows7): تثبيت lock المولد بواسطة Flutter 3.16.9'
+          git push origin "HEAD:${{ github.head_ref }}"
 
       - name: Run Drift Guard
         shell: pwsh
