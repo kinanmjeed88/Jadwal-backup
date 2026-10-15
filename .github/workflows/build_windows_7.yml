@@ -83,6 +83,14 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      # The sandbox cannot download Azure-hosted artifacts. Expose this non-secret,
+      # generated lock through the check summary so it can be committed verbatim.
+      - name: Publish Generated Lock for Review
+        shell: pwsh
+        run: |
+          $encoded = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Resolve-Path 'pubspec.lock')))
+          "LOCKFILE_BASE64_BEGIN`n$encoded`nLOCKFILE_BASE64_END" >> $env:GITHUB_STEP_SUMMARY
+
       - name: Run Drift Guard
         shell: pwsh
         run: python ../../tools/check_windows7_drift.py --root ../.. --windows7 .

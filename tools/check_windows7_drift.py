@@ -9,6 +9,7 @@ Content differences are accepted only for the exact paths listed in ALLOWED.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import sys
 import tempfile
@@ -117,6 +118,10 @@ def main() -> int:
 
     if errors:
         print("\n".join(errors), file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            for error in errors:
+                # Keep the message annotation-readable; paths are included in each error.
+                print(f"::error title=Windows 7 drift guard::{error}")
         print(f"DRIFT_GUARD_FAIL errors={len(errors)}", file=sys.stderr)
         return 1
     print(f"DRIFT_GUARD_PASS allowed_differences={len(ALLOWED)}")
