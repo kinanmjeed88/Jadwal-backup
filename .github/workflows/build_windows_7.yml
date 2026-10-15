@@ -1,0 +1,139 @@
+name: Windows 7 PoC
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [searchidf]
+    paths:
+      - 'apps/windows_7/**'
+      - 'tools/check_windows7_drift.py'
+      - '.github/workflows/build_windows_7.yml'
+  push:
+    branches: ['arena/**']
+    paths:
+      - 'apps/windows_7/**'
+      - 'tools/check_windows7_drift.py'
+      - '.github/workflows/build_windows_7.yml'
+
+jobs:
+  verify-windows-7:
+    name: Resolve, Analyze, Test, and Build Windows 7
+    runs-on: windows-2022
+    defaults:
+      run:
+        working-directory: apps/windows_7
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter 3.16.9
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.16.9'
+          channel: stable
+          cache: true
+
+      - name: Verify Flutter and Dart Versions
+        shell: pwsh
+        run: |
+          $version = flutter --version --machine | ConvertFrom-Json
+          Write-Host "Flutter=$($version.frameworkVersion); Dart=$($version.dartSdkVersion)"
+          if ($version.frameworkVersion -ne '3.16.9') {
+            throw "Expected Flutter 3.16.9, got $($version.frameworkVersion)"
+          }
+          if (-not $version.dartSdkVersion.StartsWith('3.2.6')) {
+            throw "Expected Dart 3.2.6, got $($version.dartSdkVersion)"
+          }
+
+      - name: Verify Manifest Policy
+        shell: pwsh
+        run: |
+          $manifest = Get-Content pubspec.yaml -Raw
+          if ($manifest -match '(?m)^dependency_overrides:') {
+            throw 'dependency_overrides are forbidden in the Windows 7 PoC'
+          }
+          if ($manifest -notmatch "sdk:\s*'>=3\.2\.0 <4\.0\.0'") {
+            throw 'Unexpected Dart SDK constraint'
+          }
+
+      - name: Resolve Windows 7 Dependencies
+        run: flutter pub get
+
+      - name: Capture Dependency Graph
+        shell: pwsh
+        run: flutter pub deps --json | Set-Content dependency-graph.json -Encoding utf8
+
+      - name: Validate Generated Lock SDK
+        shell: pwsh
+        run: |
+          if (-not (Test-Path pubspec.lock)) { throw 'pubspec.lock was not generated' }
+          $lock = Get-Content pubspec.lock -Raw
+          if ($lock -match 'dart:\s*">=3\.11' -or $lock -match 'flutter:\s*">=3\.38') {
+            throw 'Lockfile was resolved for the modern SDK instead of Flutter 3.16.9'
+          }
+
+      - name: Upload Generated Lock and Dependency Graph
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-7-dependency-resolution
+          path: |
+            apps/windows_7/pubspec.lock
+            apps/windows_7/dependency-graph.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Run Drift Guard
+        shell: pwsh
+        run: python ../../tools/check_windows7_drift.py --root ../.. --windows7 .
+
+      - name: Test Drift Guard Positive and Negative Cases
+        shell: pwsh
+        run: python ../../tools/check_windows7_drift.py --root ../.. --windows7 . --self-test
+
+      - name: Reject Flutter-New Dropdown API
+        shell: pwsh
+        run: |
+          $matches = Get-ChildItem lib -Recurse -Filter '*.dart' | Select-String -Pattern 'DropdownButtonFormField' -Context 0,20
+          foreach ($match in $matches) {
+            $block = @($match.Line) + @($match.Context.PostContext)
+            if (($block -join "`n") -match '\binitialValue\s*:') {
+              throw "DropdownButtonFormField.initialValue is incompatible with Flutter 3.16.9: $($match.Path):$($match.LineNumber)"
+            }
+          }
+
+      - name: Analyze Windows 7 Sources
+        run: flutter analyze --no-fatal-infos
+
+      - name: Run All Windows 7 Tests
+        run: flutter test
+
+      - name: Enable Windows Desktop
+        run: flutter config --enable-windows-desktop
+
+      - name: Build Windows 7 Release
+        run: flutter build windows --release --target=lib/main_windows.dart
+
+      - name: Verify Windows 7 Release Bundle
+        shell: pwsh
+        run: |
+          $releaseDir = 'build\windows\x64\runner\Release'
+          $exe = Join-Path $releaseDir 'JadwalV2_Windows7.exe'
+          if (-not (Test-Path $exe)) { throw "Missing Windows 7 executable: $exe" }
+          if (-not (Test-Path (Join-Path $releaseDir 'data'))) { throw 'Missing Flutter data directory' }
+          Get-FileHash $exe -Algorithm SHA256 | Format-List
+
+      - name: Run Modern-Host Smoke Test
+        shell: pwsh
+        timeout-minutes: 2
+        run: >-
+          pwsh -File windows\\packaging\\smoke_test.ps1
+          -ExecutablePath build\\windows\\x64\\runner\\Release\\JadwalV2_Windows7.exe
+
+      - name: Upload Windows 7 PoC Bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-7-poc-release
+          path: apps/windows_7/build/windows/x64/runner/Release/**
+          if-no-files-found: error
+          retention-days: 7
