@@ -314,18 +314,20 @@ jobs:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         set -uo pipefail
-        body="Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-        for f in gradle-preflight.log build-release.log android/gradle-preflight.log; do
+        diag="$RUNNER_TEMP/diag-body.md"
+        : > "$diag"
+        echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> "$diag"
+        fence='```'
+        for f in gradle-preflight.log build-release.log; do
           if [ -f "$f" ]; then
-            body="$body
-
-## $f
-
-\`\`\`
-$(tail -n 120 "$f")
-\`\`\`"
+            {
+              echo
+              echo "## $f"
+              echo
+              printf '%s\n' "$fence"
+              tail -n 120 "$f"
+              printf '%s\n' "$fence"
+            } >> "$diag"
           fi
         done
-        printf '%s' "$body" | gh issue create \
-          --title "[DIAG] فشل بناء Android الموقّع ${GITHUB_RUN_ID}" \
-          --body-file - || echo "تعذّر إنشاء issue للتشخيص"
+        gh issue create --title "[DIAG] فشل بناء Android الموقّع ${GITHUB_RUN_ID}" --body-file "$diag" || echo "تعذّر إنشاء issue للتشخيص"
