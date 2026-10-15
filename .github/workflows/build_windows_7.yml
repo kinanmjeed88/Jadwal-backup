@@ -2,12 +2,9 @@ name: Windows 7 PoC
 
 on:
   workflow_dispatch:
+  # Run on every PR revision so the Windows 7 proof is always tied to the final SHA.
   pull_request:
     branches: [searchidf]
-    paths:
-      - 'apps/windows_7/**'
-      - 'tools/check_windows7_drift.py'
-      - '.github/workflows/build_windows_7.yml'
 
 permissions:
   contents: read
