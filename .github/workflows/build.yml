@@ -165,7 +165,18 @@ jobs:
       run: |
         set -uo pipefail
         cd android
-        if ! ./gradlew :app:help --no-daemon > ../gradle-preflight.log 2>&1; then
+        # المستودع يتجاهل gradlew/gradle-wrapper.jar في .gitignore، لذا نستخدم
+        # الغلاف إن وُجد وإلا Gradle المثبّت على العدّاء.
+        if [ -x ./gradlew ]; then
+          GRADLE_CMD=./gradlew
+        elif command -v gradle >/dev/null 2>&1; then
+          GRADLE_CMD=gradle
+        else
+          echo "⚠️ لا gradlew ولا gradle متاح — تخطّي الفحص المسبق."
+          exit 0
+        fi
+        echo "الفحص المسبق عبر: $GRADLE_CMD"
+        if ! "$GRADLE_CMD" :app:help --no-daemon > ../gradle-preflight.log 2>&1; then
           {
             echo "## ❌ فشل إعداد Gradle لوضع release"
             echo
