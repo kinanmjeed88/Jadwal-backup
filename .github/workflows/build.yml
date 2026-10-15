@@ -305,3 +305,27 @@ jobs:
     - name: Destroy Decoded Keystore
       if: always()
       run: rm -f "$RUNNER_TEMP/upload-keystore.jks" "$RUNNER_TEMP/apksigner.txt"
+
+    # ⚠️ خطوة تشخيص مؤقتة: تنشر ذيل سجل الفشل كـ Issue لأن نطاق تخزين سجلات
+    # Actions غير متاح من بيئة الفحص الحالية. تُحذف بعد تشخيص فشل البناء.
+    - name: DIAG Publish Failure Log
+      if: failure()
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -uo pipefail
+        body="Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+        for f in gradle-preflight.log build-release.log android/gradle-preflight.log; do
+          if [ -f "$f" ]; then
+            body="$body
+
+## $f
+
+\`\`\`
+$(tail -n 120 "$f")
+\`\`\`"
+          fi
+        done
+        printf '%s' "$body" | gh issue create \
+          --title "[DIAG] فشل بناء Android الموقّع ${GITHUB_RUN_ID}" \
+          --body-file - || echo "تعذّر إنشاء issue للتشخيص"
