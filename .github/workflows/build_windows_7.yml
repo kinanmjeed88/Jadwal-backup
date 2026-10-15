@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.head_ref || github.ref_name }}
 
@@ -70,7 +70,7 @@ jobs:
           }
 
       - name: Upload Generated Lock and Dependency Graph
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-7-dependency-resolution
           path: |
@@ -135,7 +135,7 @@ jobs:
           -ExecutablePath build\\windows\\x64\\runner\\Release\\JadwalV2_Windows7.exe
 
       - name: Upload Windows 7 PoC Bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: windows-7-poc-release
           path: apps/windows_7/build/windows/x64/runner/Release/**
