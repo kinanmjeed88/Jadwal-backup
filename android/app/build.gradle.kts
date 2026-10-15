@@ -126,10 +126,11 @@ android {
                 keyAlias = signingKeyAlias
                 keyPassword = signingKeyPassword
                 // مخططات التوقيع الحديثة إلزامية حتى لا يُنتَج إصدار بتوقيع v1 فقط.
-                isEnableV1Signing = true
-                isEnableV2Signing = true
-                isEnableV3Signing = true
-                isEnableV4Signing = true
+                // (أسماء الخصائص كما في AGP 8.6: ApkSigningConfig.enableV{1..4}Signing)
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
+                enableV4Signing = true
             }
             println("[jadwal-signing] ✅ التوقيع الرسمي مُحمَّل: alias=${signingKeyAlias}, store=${signingStoreFile.name}")
         }
