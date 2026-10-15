@@ -10,6 +10,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # مطلوبة مؤقتاً لخطوة التشخيص التي تنشر سجل الفشل كـ Issue.
+      issues: write
     steps:
     - uses: actions/checkout@v4
 
@@ -330,4 +334,5 @@ jobs:
             } >> "$diag"
           fi
         done
-        gh issue create --title "[DIAG] فشل بناء Android الموقّع ${GITHUB_RUN_ID}" --body-file "$diag" || echo "تعذّر إنشاء issue للتشخيص"
+        gh issue create --title "[DIAG] فشل بناء Android الموقّع ${GITHUB_RUN_ID}" --body-file "$diag" \
+          || { echo "تعذّر إنشاء issue للتشخيص:"; head -c 400 "$diag"; }
