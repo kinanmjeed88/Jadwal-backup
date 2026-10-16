@@ -9,12 +9,15 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # مثبّت على 24.04: تسمية ubuntu-latest ستنتقل إلى Ubuntu 26 ابتداءً من
+    # 2026-10-19 (تنبيه ظهر في مخرجات آخر بناء)، والتثبيت يمنع تغيير بيئة
+    # البناء فجأة تحت إصدار قيد التجهيز.
+    runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
 
     - name: Setup Java
-      uses: actions/setup-java@v3
+      uses: actions/setup-java@v5
       with:
         distribution: 'zulu'
         java-version: '17'
@@ -249,14 +252,14 @@ jobs:
 
     - name: Upload Signed Release APK
       if: steps.signing.outputs.available == 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: release-apk
         path: build/app/outputs/flutter-apk/app-release.apk
 
     - name: Upload Unsigned Verification APK
       if: steps.signing.outputs.available != 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: debug-verification-apk
         path: build/app/outputs/flutter-apk/app-debug.apk

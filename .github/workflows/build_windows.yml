@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -160,14 +160,14 @@ jobs:
           -Path dist\\Jadwal-V2-Windows-10-11-${{ steps.version.outputs.version }}-Setup.exe
 
       - name: Archive Windows Release Bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Jadwal-Windows-10-11-Release-${{ steps.version.outputs.version }}
           path: build\\windows\\x64\\runner\\Release\\*
           retention-days: 7
 
       - name: Upload Windows ZIP and Installer
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: Jadwal-Windows-10-11-Distributables-${{ steps.version.outputs.version }}
           path: |
