@@ -134,6 +134,47 @@ jobs:
           pwsh -File windows\\packaging\\smoke_test.ps1
           -ExecutablePath build\\windows\\x64\\runner\\Release\\JadwalV2_Windows7.exe
 
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Package Windows 7 ZIP and Installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pubspec = Get-Content pubspec.yaml -Raw
+          if ($pubspec -notmatch '(?m)^version:\s*([0-9]+\.[0-9]+\.[0-9]+)') {
+            throw 'Unable to read application version from pubspec.yaml'
+          }
+          $version = $Matches[1]
+          $releaseDir = (Resolve-Path 'build\windows\x64\runner\Release').Path
+          $distDir = Join-Path (Get-Location) 'dist'
+          New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+
+          $zipPath = Join-Path $distDir "Jadwal-V2-Windows-7-$version.zip"
+          Compress-Archive -Path (Join-Path $releaseDir '*') -DestinationPath $zipPath -Force
+          if (-not (Test-Path $zipPath)) { throw "ZIP was not produced: $zipPath" }
+
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { throw "Inno Setup compiler not found: $iscc" }
+          & $iscc "/DAppVersion=$version" "/DSourceDir=$releaseDir" "/DOutputDir=$distDir" 'windows\packaging\jadwal_v2.iss'
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed with exit code $LASTEXITCODE" }
+
+          $setupPath = Join-Path $distDir "Jadwal-V2-Windows-7-$version-Setup.exe"
+          if (-not (Test-Path $setupPath)) { throw "Installer was not produced: $setupPath" }
+          Get-ChildItem -LiteralPath $distDir | Format-Table Name, Length -AutoSize | Out-String | Write-Host
+          Get-FileHash $setupPath -Algorithm SHA256 | Format-List
+
+      - name: Upload Windows 7 Distributables (ZIP and Installer)
+        uses: actions/upload-artifact@v6
+        with:
+          name: windows-7-distributables
+          path: |
+            apps/windows_7/dist/*.zip
+            apps/windows_7/dist/*.exe
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload Windows 7 PoC Bundle
         uses: actions/upload-artifact@v6
         with:
