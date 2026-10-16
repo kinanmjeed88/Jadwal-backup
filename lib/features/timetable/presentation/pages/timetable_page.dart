@@ -169,8 +169,71 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
     }
   }
 
-  Future<void> _exportToPdf() async {
+  Future<TimetablePdfExportMode?> _showPdfExportModeDialog() {
+    return showDialog<TimetablePdfExportMode>(
+      context: context,
+      builder: (dialogContext) => Directionality(
+        textDirection: TextDirection.rtl,
+        child: AlertDialog(
+          title: const Text(
+            'تصدير جدول الفصول (PDF)',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Card(
+                margin: const EdgeInsets.only(bottom: 8),
+                child: ListTile(
+                  leading: const Icon(Icons.grid_on, color: Colors.teal),
+                  title: const Text(
+                    'تصدير جدول كامل',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: const Text(
+                    'جميع الصفوف والشعب في جدول واحد موحّد',
+                  ),
+                  onTap: () => Navigator.of(dialogContext).pop(
+                    TimetablePdfExportMode.full,
+                  ),
+                ),
+              ),
+              Card(
+                margin: EdgeInsets.zero,
+                child: ListTile(
+                  leading: const Icon(Icons.layers, color: Colors.teal),
+                  title: const Text(
+                    'تصدير جدول مقسم',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  subtitle: const Text(
+                    'كل صف مع شعبه فقط في ورقة A4 خاصة به',
+                  ),
+                  onTap: () => Navigator.of(dialogContext).pop(
+                    TimetablePdfExportMode.splitByGrade,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('إلغاء'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _exportToPdf([TimetablePdfExportMode? requestedMode]) async {
     try {
+      final selectedMode = requestedMode ?? await _showPdfExportModeDialog();
+      if (selectedMode == null || !mounted) {
+        return;
+      }
+
       final isar = await ref.read(isarDatabaseProvider.future);
 
       // Load and guarantee all links are resolved within a single transaction
@@ -191,12 +254,20 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
           : (AppSettings()..periodsPerDay = 7);
 
       final pdfUsecase = PdfExportUseCase();
-      final pdfBytes =
-          await pdfUsecase.generateTimetablePdf(lessons, classRooms, settings);
+      final pdfBytes = await pdfUsecase.generateTimetablePdf(
+        lessons,
+        classRooms,
+        settings,
+        mode: selectedMode,
+      );
+
+      final defaultFileName = selectedMode == TimetablePdfExportMode.splitByGrade
+          ? 'timetable_split.pdf'
+          : 'timetable.pdf';
 
       final outcome = await ref.read(fileSaveServiceProvider).saveBytes(
             dialogTitle: 'حفظ ملف PDF',
-            fileName: 'timetable.pdf',
+            fileName: defaultFileName,
             allowedExtensions: ['pdf'],
             bytes: pdfBytes,
           );
