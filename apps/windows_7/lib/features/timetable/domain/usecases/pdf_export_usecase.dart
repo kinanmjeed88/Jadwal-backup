@@ -13,15 +13,49 @@ import '../../../../core/models/teacher.dart';
 import '../../../../core/models/weekly_load_policy.dart';
 import '../../../../core/utils/timetable_display_utils.dart';
 
-const double _highResFactor = 3.0;
+const double _highResFactor = 1.0;
 
 /// نمط تصدير جدول الفصول إلى ملف PDF.
 enum TimetablePdfExportMode {
   /// تصدير الجدول كاملاً (جميع الصفوف والشعب في جدول واحد موحّد).
   full,
 
-  /// تصدير الجدول مقسماً بحيث تحتوي كل ورقة A4 على صف واحد مع جميع شعبه فقط.
+  /// تصدير الجدول مقسماً على أوراق A4 بحسب عدد الصفوف المحدد لكل ورقة.
   splitByGrade,
+}
+
+/// إعدادات عملية تصدير جدول الفصول إلى PDF التي يختارها المستخدم عند التصدير.
+class TimetablePdfExportConfig {
+  const TimetablePdfExportConfig({
+    required this.mode,
+    this.gradesPerPage = 1,
+  }) : assert(gradesPerPage >= 1, 'gradesPerPage must be at least 1');
+
+  const TimetablePdfExportConfig.full()
+      : mode = TimetablePdfExportMode.full,
+        gradesPerPage = 1;
+
+  const TimetablePdfExportConfig.split({int gradesPerPage = 1})
+      : mode = TimetablePdfExportMode.splitByGrade,
+        gradesPerPage = gradesPerPage < 1 ? 1 : gradesPerPage;
+
+  final TimetablePdfExportMode mode;
+
+  /// عدد الصفوف الدراسية في كل ورقة A4 عند اختيار التصدير المقسم.
+  final int gradesPerPage;
+}
+
+/// حزمة البيانات اللازمة لتصدير جدول الفصول إلى PDF.
+class TimetablePdfExportData {
+  const TimetablePdfExportData({
+    required this.lessons,
+    required this.classrooms,
+    required this.settings,
+  });
+
+  final List<Lesson> lessons;
+  final List<Classroom> classrooms;
+  final AppSettings settings;
 }
 
 /// يمثل مجموعة صف دراسي واحد مع كافة الشعب التابعة له.
@@ -39,11 +73,29 @@ class ClassroomGradeGroup {
   /// العنوان المعروض للصف الدراسي (مثال: `الصف الأول`).
   final String title;
 
-  /// الترتيب المنطقي للصف (1 للأول، 2 للثاني، ...).
+  /// الترتيب المنطقي للصف (10 للأول، 20 للثاني، ...).
   final int sortOrder;
 
   /// قائمة الشعب التابعة لهذا الصف مرتبة حسب تسلسل الشعب.
   final List<Classroom> classrooms;
+}
+
+/// يمثل محتوى ورقة A4 واحدة في التصدير المقسم (صف واحد أو عدة صفوف مع جميع شعبها).
+class PdfGradePageChunk {
+  const PdfGradePageChunk({
+    required this.gradeGroups,
+    required this.classrooms,
+    required this.subtitle,
+  });
+
+  /// مجموعات الصفوف الدراسية المضمنة في هذه الورقة بالترتيب الأكاديمي.
+  final List<ClassroomGradeGroup> gradeGroups;
+
+  /// جميع الشعب التابعة لهذه الصفوف مجتمعة ومرتبة.
+  final List<Classroom> classrooms;
+
+  /// العنوان الفرعي للورقة (مثال: «الصف الأول» أو «الصف الأول - الصف الثاني»).
+  final String subtitle;
 }
 
 class PdfExportUseCase {
@@ -51,6 +103,20 @@ class PdfExportUseCase {
     final now = DateTime.now();
     int startYear = now.month >= 9 ? now.year : now.year - 1;
     return '$startYear/${startYear + 1}';
+  }
+
+  /// يصوغ التسمية العربية لخيار عدد الصفوف في كل ورقة A4.
+  static String formatGradesPerPageLabel(int gradesPerPage) {
+    if (gradesPerPage <= 1) {
+      return 'صف واحد في كل ورقة';
+    }
+    if (gradesPerPage == 2) {
+      return 'صفّان في كل ورقة';
+    }
+    if (gradesPerPage >= 3 && gradesPerPage <= 10) {
+      return '$gradesPerPage صفوف في كل ورقة';
+    }
+    return '$gradesPerPage صفاً في كل ورقة';
   }
 
   /// يجمع الفصول الدراسية حسب الصف الدراسي ويرتب الصفوف والشعب ترتيباً أكاديمياً سليماً.
@@ -104,6 +170,44 @@ class PdfExportUseCase {
         .toList(growable: false);
   }
 
+  /// يوزع الصفوف الدراسية (مع كامل شعب كل صف) على أوراق A4 بحيث تحتوي كل ورقة
+  /// على [gradesPerPage] صفوف كحد أقصى وفق الترتيب الأكاديمي.
+  ///
+  /// إذا كان عدد الصفوف بعد التجميع `N` والعدد المختار لكل ورقة `K`،
+  /// فإن عدد الأوراق الناتج هو `ceil(N / K)`، ولا تنفصل شعب الصف الواحد بين ورقتين.
+  static List<PdfGradePageChunk> distributeClassroomsByGradesPerPage(
+    List<Classroom> classrooms, {
+    int gradesPerPage = 1,
+  }) {
+    final effectiveGradesPerPage = math.max(1, gradesPerPage);
+    final groups = groupClassroomsByGrade(classrooms)
+        .where((g) => g.classrooms.isNotEmpty)
+        .toList(growable: false);
+
+    if (groups.isEmpty) {
+      return const <PdfGradePageChunk>[];
+    }
+
+    final List<PdfGradePageChunk> chunks = [];
+    for (var i = 0; i < groups.length; i += effectiveGradesPerPage) {
+      final end = math.min(i + effectiveGradesPerPage, groups.length);
+      final slice = groups.sublist(i, end);
+      final chunkClassrooms = <Classroom>[
+        for (final group in slice) ...group.classrooms,
+      ];
+      final subtitle = slice.map((g) => g.title).join(' - ');
+      chunks.add(
+        PdfGradePageChunk(
+          gradeGroups: List<ClassroomGradeGroup>.unmodifiable(slice),
+          classrooms: List<Classroom>.unmodifiable(chunkClassrooms),
+          subtitle: subtitle,
+        ),
+      );
+    }
+
+    return List<PdfGradePageChunk>.unmodifiable(chunks);
+  }
+
   /// يرتب جميع الفصول الدراسية حسب ترتيب صفوفها ثم ترتيب الشعب داخل كل صف.
   static List<Classroom> sortClassrooms(List<Classroom> classrooms) {
     final groups = groupClassroomsByGrade(classrooms);
@@ -116,11 +220,12 @@ class PdfExportUseCase {
     final rawGrade = ((classroom.grade as String?) ?? '').trim();
     final rawName = ((classroom.name as String?) ?? '').trim();
 
-    final academicGrade =
-        _parseAcademicGrade(rawGrade) ?? _parseAcademicGrade(rawName);
+    final parsedGrade =
+        _parseAcademicGradeDescriptor(rawGrade) ??
+        _parseAcademicGradeDescriptor(rawName);
     final branch = _extractBranchLabel('$rawGrade $rawName');
 
-    if (academicGrade != null) {
+    if (parsedGrade != null) {
       final branchSuffix = branch != null ? ':$branch' : '';
       final branchTitle = branch != null ? ' $branch' : '';
       final branchOrderOffset = branch == 'علمي'
@@ -129,9 +234,9 @@ class PdfExportUseCase {
               ? 2
               : 0;
       return _ResolvedGradeIdentity(
-        key: 'grade:${academicGrade.order}$branchSuffix',
-        title: 'الصف ${academicGrade.label}$branchTitle',
-        sortOrder: academicGrade.order * 10 + branchOrderOffset,
+        key: 'grade:${parsedGrade.order}$branchSuffix',
+        title: 'الصف ${parsedGrade.label}$branchTitle',
+        sortOrder: parsedGrade.order * 10 + branchOrderOffset,
       );
     }
 
@@ -151,46 +256,130 @@ class PdfExportUseCase {
     );
   }
 
-  /// يستخرج الصف الدراسي (الأول..السادس) مع إعطاء الأولوية للكلمات العربية
+  /// يستخرج الصف الدراسي (الأول..الثاني عشر) مع إعطاء الأولوية للكلمات العربية
   /// قبل الأرقام لتفادي الخلط بين رقم الشعبة (مثل «الأول 2») ورقم الصف.
-  static AcademicGrade? _parseAcademicGrade(String? raw) {
+  static _AcademicGradeDescriptor? _parseAcademicGradeDescriptor(String? raw) {
     if (raw == null || raw.trim().isEmpty) {
       return null;
     }
     final normalized = _normalizeArabicText(raw);
 
-    if (normalized.contains('سادس')) return AcademicGrade.sixth;
-    if (normalized.contains('خامس')) return AcademicGrade.fifth;
-    if (normalized.contains('رابع')) return AcademicGrade.fourth;
-    if (normalized.contains('ثالث')) return AcademicGrade.third;
+    // فحص الصفوف المركبة أولاً (الحادي عشر، الثاني عشر) قبل المفردة (الأول، الثاني)
+    if (normalized.contains('ثاني عشر') || normalized.contains('الثاني عشر')) {
+      return const _AcademicGradeDescriptor(order: 12, label: 'الثاني عشر');
+    }
+    if (normalized.contains('حادي عشر') || normalized.contains('الحادي عشر')) {
+      return const _AcademicGradeDescriptor(order: 11, label: 'الحادي عشر');
+    }
+    if (normalized.contains('عاشر')) {
+      return const _AcademicGradeDescriptor(order: 10, label: 'العاشر');
+    }
+    if (normalized.contains('تاسع')) {
+      return const _AcademicGradeDescriptor(order: 9, label: 'التاسع');
+    }
+    if (normalized.contains('ثامن')) {
+      return const _AcademicGradeDescriptor(order: 8, label: 'الثامن');
+    }
+    if (normalized.contains('سابع')) {
+      return const _AcademicGradeDescriptor(order: 7, label: 'السابع');
+    }
+    if (normalized.contains('سادس')) {
+      return _AcademicGradeDescriptor(
+        order: AcademicGrade.sixth.order,
+        label: AcademicGrade.sixth.label,
+      );
+    }
+    if (normalized.contains('خامس')) {
+      return _AcademicGradeDescriptor(
+        order: AcademicGrade.fifth.order,
+        label: AcademicGrade.fifth.label,
+      );
+    }
+    if (normalized.contains('رابع')) {
+      return _AcademicGradeDescriptor(
+        order: AcademicGrade.fourth.order,
+        label: AcademicGrade.fourth.label,
+      );
+    }
+    if (normalized.contains('ثالث')) {
+      return _AcademicGradeDescriptor(
+        order: AcademicGrade.third.order,
+        label: AcademicGrade.third.label,
+      );
+    }
     if (normalized.contains('ثاني') ||
         RegExp(r'(^|[\s/\-_])ثان($|[\s/\-_])').hasMatch(normalized)) {
-      return AcademicGrade.second;
+      return _AcademicGradeDescriptor(
+        order: AcademicGrade.second.order,
+        label: AcademicGrade.second.label,
+      );
     }
-    if (normalized.contains('اول')) return AcademicGrade.first;
+    if (normalized.contains('اول')) {
+      return _AcademicGradeDescriptor(
+        order: AcademicGrade.first.order,
+        label: AcademicGrade.first.label,
+      );
+    }
 
     final digitMatch = RegExp(
-      r'(?:^|[\s/\-_\(\)])([1-6١-٦])(?=$|[\s/\-_\(\)])',
+      r'(?:^|[\s/\-_\(\)])(1[0-2]|[1-9]|١[٠-٢]|[١-٩])(?=$|[\s/\-_\(\)])',
     ).firstMatch(normalized);
     if (digitMatch != null) {
       final digit = _arabicIndicToWestern(digitMatch.group(1)!);
       switch (digit) {
         case '1':
-          return AcademicGrade.first;
+          return _AcademicGradeDescriptor(
+            order: AcademicGrade.first.order,
+            label: AcademicGrade.first.label,
+          );
         case '2':
-          return AcademicGrade.second;
+          return _AcademicGradeDescriptor(
+            order: AcademicGrade.second.order,
+            label: AcademicGrade.second.label,
+          );
         case '3':
-          return AcademicGrade.third;
+          return _AcademicGradeDescriptor(
+            order: AcademicGrade.third.order,
+            label: AcademicGrade.third.label,
+          );
         case '4':
-          return AcademicGrade.fourth;
+          return _AcademicGradeDescriptor(
+            order: AcademicGrade.fourth.order,
+            label: AcademicGrade.fourth.label,
+          );
         case '5':
-          return AcademicGrade.fifth;
+          return _AcademicGradeDescriptor(
+            order: AcademicGrade.fifth.order,
+            label: AcademicGrade.fifth.label,
+          );
         case '6':
-          return AcademicGrade.sixth;
+          return _AcademicGradeDescriptor(
+            order: AcademicGrade.sixth.order,
+            label: AcademicGrade.sixth.label,
+          );
+        case '7':
+          return const _AcademicGradeDescriptor(order: 7, label: 'السابع');
+        case '8':
+          return const _AcademicGradeDescriptor(order: 8, label: 'الثامن');
+        case '9':
+          return const _AcademicGradeDescriptor(order: 9, label: 'التاسع');
+        case '10':
+          return const _AcademicGradeDescriptor(order: 10, label: 'العاشر');
+        case '11':
+          return const _AcademicGradeDescriptor(order: 11, label: 'الحادي عشر');
+        case '12':
+          return const _AcademicGradeDescriptor(order: 12, label: 'الثاني عشر');
       }
     }
 
-    return AcademicGrade.tryParse(raw);
+    final fallback = AcademicGrade.tryParse(raw);
+    if (fallback != null) {
+      return _AcademicGradeDescriptor(
+        order: fallback.order,
+        label: fallback.label,
+      );
+    }
+    return null;
   }
 
   static String? _extractBranchLabel(String raw) {
@@ -247,6 +436,17 @@ class PdfExportUseCase {
       'خامس',
       'السادس',
       'سادس',
+      'السابع',
+      'سابع',
+      'الثامن',
+      'ثامن',
+      'التاسع',
+      'تاسع',
+      'العاشر',
+      'عاشر',
+      'الحادي',
+      'حادي',
+      'عشر',
       'الابتدايي',
       'ابتدايي',
       'الابتداييه',
@@ -569,6 +769,7 @@ class PdfExportUseCase {
     List<Classroom> classrooms,
     AppSettings settings, {
     TimetablePdfExportMode mode = TimetablePdfExportMode.full,
+    int gradesPerPage = 1,
   }) async {
     final doc = pw.Document();
 
@@ -576,7 +777,7 @@ class PdfExportUseCase {
 
     final PdfPageFormat baseFormat;
     if (mode == TimetablePdfExportMode.splitByGrade) {
-      // في التصدير المقسم: كل صف مع شعبه في ورقة A4 خاصة به
+      // في التصدير المقسم: تستخدم كل ورقة مقاس A4 الفيزيائي القياسي دائماً
       baseFormat = PdfPageFormat.a4;
     } else {
       switch (settings.exportPageSize) {
@@ -612,7 +813,7 @@ class PdfExportUseCase {
         ? baseFormat.portrait
         : baseFormat.landscape;
 
-    final PdfPageFormat highResFormat = PdfPageFormat(
+    final PdfPageFormat pageFormat = PdfPageFormat(
       format.width * _highResFactor,
       format.height * _highResFactor,
       marginTop: 20 * _highResFactor,
@@ -623,13 +824,16 @@ class PdfExportUseCase {
 
     final List<_PdfPageChunk> pageChunks = [];
     if (mode == TimetablePdfExportMode.splitByGrade) {
-      final groups = groupClassroomsByGrade(classrooms);
-      for (final group in groups) {
-        if (group.classrooms.isNotEmpty) {
+      final distributedChunks = distributeClassroomsByGradesPerPage(
+        classrooms,
+        gradesPerPage: gradesPerPage,
+      );
+      for (final chunk in distributedChunks) {
+        if (chunk.classrooms.isNotEmpty) {
           pageChunks.add(
             _PdfPageChunk(
-              classrooms: group.classrooms,
-              subtitle: group.title,
+              classrooms: chunk.classrooms,
+              subtitle: chunk.subtitle,
             ),
           );
         }
@@ -662,7 +866,7 @@ class PdfExportUseCase {
     for (final pageChunk in pageChunks) {
       doc.addPage(
         pw.Page(
-          pageFormat: highResFormat,
+          pageFormat: pageFormat,
           textDirection: pw.TextDirection.rtl,
           margin: pw.EdgeInsets.all(20 * _highResFactor),
           theme: pw.ThemeData.withFont(
@@ -682,7 +886,7 @@ class PdfExportUseCase {
                       lessonMap,
                       settings,
                       font,
-                      highResFormat.availableHeight - (120 * _highResFactor),
+                      pageFormat.availableHeight - (120 * _highResFactor),
                     ),
                   ),
                   _buildFooter(settings, font, context),
@@ -730,13 +934,17 @@ class PdfExportUseCase {
               ),
               if (subtitle != null) ...[
                 pw.SizedBox(height: 4 * _highResFactor),
-                pw.Text(
-                  subtitle,
-                  style: pw.TextStyle(
-                      fontSize: 16 * _highResFactor,
-                      font: font,
-                      fontWeight: pw.FontWeight.bold),
-                  textAlign: pw.TextAlign.center,
+                pw.FittedBox(
+                  fit: pw.BoxFit.scaleDown,
+                  child: pw.Text(
+                    subtitle,
+                    maxLines: 1,
+                    style: pw.TextStyle(
+                        fontSize: 16 * _highResFactor,
+                        font: font,
+                        fontWeight: pw.FontWeight.bold),
+                    textAlign: pw.TextAlign.center,
+                  ),
                 ),
               ],
               pw.SizedBox(height: 4 * _highResFactor),
@@ -793,19 +1001,19 @@ class PdfExportUseCase {
       }
     }
 
-    bool isA3Layout = chunk.length > 4;
+    bool isDenseLayout = chunk.length > 4;
 
     final int totalCols = 2 + chunk.length;
 
     final Map<int, pw.TableColumnWidth> columnWidths = {
-      totalCols - 1: isA3Layout
-          ? const pw.FlexColumnWidth(1.0)
+      totalCols - 1: isDenseLayout
+          ? const pw.FlexColumnWidth(0.75)
           : const pw.FlexColumnWidth(0.5),
-      totalCols - 2: isA3Layout
-          ? const pw.FlexColumnWidth(1.0)
+      totalCols - 2: isDenseLayout
+          ? const pw.FlexColumnWidth(0.45)
           : const pw.FlexColumnWidth(0.3),
       for (int i = 0; i < chunk.length; i++)
-        totalCols - 3 - i: isA3Layout
+        totalCols - 3 - i: isDenseLayout
             ? const pw.FlexColumnWidth(1.0)
             : const pw.FlexColumnWidth(2.0),
     };
@@ -899,6 +1107,7 @@ class PdfExportUseCase {
                 style: pw.TextStyle(
                   font: font,
                   fontWeight: pw.FontWeight.bold,
+                  fontSize: 10 * _highResFactor,
                 ),
               ),
             );
@@ -971,8 +1180,10 @@ class PdfExportUseCase {
         fit: pw.BoxFit.scaleDown,
         child: pw.Text(
           text,
+          maxLines: 1,
           style: pw.TextStyle(
             font: font,
+            fontSize: 10 * _highResFactor,
             fontWeight: (isHeader || isBold)
                 ? pw.FontWeight.bold
                 : pw.FontWeight.normal,
@@ -982,6 +1193,16 @@ class PdfExportUseCase {
       ),
     );
   }
+}
+
+class _AcademicGradeDescriptor {
+  const _AcademicGradeDescriptor({
+    required this.order,
+    required this.label,
+  });
+
+  final int order;
+  final String label;
 }
 
 class _ResolvedGradeIdentity {
