@@ -66,8 +66,166 @@ class ConflictMessageMapper {
   }
 }
 
+Future<int?> showTimetableGradesPerPageDialog(
+  BuildContext context, {
+  int availableGradeCount = 6,
+  int initialGradesPerPage = 1,
+}) {
+  final int maxOptions = availableGradeCount > 6 ? availableGradeCount : 6;
+  int selectedGradesPerPage =
+      initialGradesPerPage.clamp(1, maxOptions).toInt();
+
+  return showDialog<int>(
+    context: context,
+    builder: (dialogContext) => Directionality(
+      textDirection: TextDirection.rtl,
+      child: StatefulBuilder(
+        builder: (dialogContext, setDialogState) => AlertDialog(
+          title: const Text(
+            'عدد الصفوف في كل ورقة A4',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+          content: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420, maxHeight: 380),
+            child: SingleChildScrollView(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  const Text(
+                    'اختر عدد الصفوف الدراسية في كل ورقة A4 (تُجمع شعب كل صف تلقائياً بالترتيب الأكاديمي):',
+                    style: TextStyle(fontSize: 14),
+                  ),
+                  const SizedBox(height: 12),
+                  for (int count = 1; count <= maxOptions; count++)
+                    RadioListTile<int>(
+                      value: count,
+                      groupValue: selectedGradesPerPage,
+                      activeColor: Colors.teal,
+                      dense: true,
+                      contentPadding: EdgeInsets.zero,
+                      title: Text(
+                        PdfExportUseCase.formatGradesPerPageLabel(count),
+                        style: TextStyle(
+                          fontWeight: selectedGradesPerPage == count
+                              ? FontWeight.bold
+                              : FontWeight.normal,
+                        ),
+                      ),
+                      onChanged: (value) {
+                        if (value == null) return;
+                        setDialogState(() {
+                          selectedGradesPerPage = value;
+                        });
+                      },
+                    ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: const Text('إلغاء'),
+            ),
+            ElevatedButton(
+              onPressed: () =>
+                  Navigator.of(dialogContext).pop(selectedGradesPerPage),
+              child: const Text('تصدير PDF'),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+}
+
+Future<TimetablePdfExportConfig?> showTimetablePdfExportDialog(
+  BuildContext context, {
+  int availableGradeCount = 6,
+}) async {
+  final selectedMode = await showDialog<TimetablePdfExportMode>(
+    context: context,
+    builder: (dialogContext) => Directionality(
+      textDirection: TextDirection.rtl,
+      child: AlertDialog(
+        title: const Text(
+          'تصدير جدول الفصول (PDF)',
+          style: TextStyle(fontWeight: FontWeight.bold),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Card(
+              margin: const EdgeInsets.only(bottom: 8),
+              child: ListTile(
+                leading: const Icon(Icons.grid_on, color: Colors.teal),
+                title: const Text(
+                  'تصدير جدول كامل',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                subtitle: const Text(
+                  'جميع الصفوف والشعب في جدول واحد موحّد',
+                ),
+                onTap: () => Navigator.of(dialogContext).pop(
+                  TimetablePdfExportMode.full,
+                ),
+              ),
+            ),
+            Card(
+              margin: EdgeInsets.zero,
+              child: ListTile(
+                leading: const Icon(Icons.layers, color: Colors.teal),
+                title: const Text(
+                  'تصدير جدول مقسم',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                subtitle: const Text(
+                  'توزيع الصفوف مع شعبها على أوراق A4 حسب العدد المحدد',
+                ),
+                onTap: () => Navigator.of(dialogContext).pop(
+                  TimetablePdfExportMode.splitByGrade,
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: const Text('إلغاء'),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  if (selectedMode == null || !context.mounted) {
+    return null;
+  }
+
+  if (selectedMode == TimetablePdfExportMode.full) {
+    return const TimetablePdfExportConfig.full();
+  }
+
+  final gradesPerPage = await showTimetableGradesPerPageDialog(
+    context,
+    availableGradeCount: availableGradeCount,
+  );
+  if (gradesPerPage == null) {
+    return null;
+  }
+
+  return TimetablePdfExportConfig.split(gradesPerPage: gradesPerPage);
+}
+
 class TimetablePage extends ConsumerStatefulWidget {
-  const TimetablePage({super.key});
+  const TimetablePage({
+    super.key,
+    this.pdfExportDataLoader,
+  });
+
+  final Future<TimetablePdfExportData> Function()? pdfExportDataLoader;
 
   @override
   ConsumerState<TimetablePage> createState() => _TimetablePageState();
@@ -80,6 +238,7 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
   final GlobalKey _visibleTimetableKey = GlobalKey();
   final TransformationController _transformationController =
       TransformationController();
+  bool _isExportingPdf = false;
 
   @override
   void initState() {
@@ -169,34 +328,104 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
     }
   }
 
-  Future<void> _exportToPdf() async {
+  Future<TimetablePdfExportData> _loadPdfExportData() async {
+    final customLoader = widget.pdfExportDataLoader;
+    if (customLoader != null) {
+      return customLoader();
+    }
+
+    final isar = await ref.read(isarDatabaseProvider.future);
+
+    // Load and guarantee all links are resolved within a single transaction
+    final List<Lesson> lessons = isar.txnSync(() {
+      final all = isar.lessons.where().findAllSync();
+      for (var lesson in all) {
+        lesson.classroom.loadSync();
+        lesson.subject.loadSync();
+        lesson.teacher.loadSync();
+      }
+      return all;
+    });
+
+    final classRooms = await isar.collection<Classroom>().where().findAll();
+    final settingsList = await isar.appSettings.where().findAll();
+    final settings = settingsList.isNotEmpty
+        ? settingsList.first
+        : (AppSettings()..periodsPerDay = 7);
+
+    return TimetablePdfExportData(
+      lessons: lessons,
+      classrooms: classRooms,
+      settings: settings,
+    );
+  }
+
+  Future<int> _resolveAvailableGradeCount() async {
     try {
-      final isar = await ref.read(isarDatabaseProvider.future);
+      final customLoader = widget.pdfExportDataLoader;
+      if (customLoader != null) {
+        final data = await customLoader();
+        final count =
+            PdfExportUseCase.groupClassroomsByGrade(data.classrooms).length;
+        return count > 0 ? count : 6;
+      }
 
-      // Load and guarantee all links are resolved within a single transaction
-      final List<Lesson> lessons = isar.txnSync(() {
-        final all = isar.lessons.where().findAllSync();
-        for (var lesson in all) {
-          lesson.classroom.loadSync();
-          lesson.subject.loadSync();
-          lesson.teacher.loadSync();
-        }
-        return all;
-      });
+      final isarAsync = ref.read(isarDatabaseProvider);
+      final isar = isarAsync is AsyncData<Isar> ? isarAsync.value : null;
+      if (isar != null) {
+        final classrooms = await isar.collection<Classroom>().where().findAll();
+        final count =
+            PdfExportUseCase.groupClassroomsByGrade(classrooms).length;
+        return count > 0 ? count : 6;
+      }
+    } catch (_) {
+      // Fallback to default range if database is not yet ready
+    }
+    return 6;
+  }
 
-      final classRooms = await isar.collection<Classroom>().where().findAll();
-      final settingsList = await isar.appSettings.where().findAll();
-      final settings = settingsList.isNotEmpty
-          ? settingsList.first
-          : (AppSettings()..periodsPerDay = 7);
+  Future<void> _exportToPdf([TimetablePdfExportConfig? requestedConfig]) async {
+    if (_isExportingPdf) {
+      return;
+    }
+    _isExportingPdf = true;
+    try {
+      final availableGradeCount = await _resolveAvailableGradeCount();
+      if (!mounted) {
+        return;
+      }
+
+      final exportConfig = requestedConfig ??
+           await showTimetablePdfExportDialog(
+            context,
+            availableGradeCount: availableGradeCount,
+          );
+      if (exportConfig == null || !mounted) {
+        return;
+      }
+
+      final exportData = await _loadPdfExportData();
+      if (!mounted) {
+        return;
+      }
 
       final pdfUsecase = PdfExportUseCase();
-      final pdfBytes =
-          await pdfUsecase.generateTimetablePdf(lessons, classRooms, settings);
+      final pdfBytes = await pdfUsecase.generateTimetablePdf(
+        exportData.lessons,
+        exportData.classrooms,
+        exportData.settings,
+        mode: exportConfig.mode,
+        gradesPerPage: exportConfig.gradesPerPage,
+      );
+
+      final defaultFileName =
+          exportConfig.mode == TimetablePdfExportMode.splitByGrade
+              ? 'timetable_split.pdf'
+              : 'timetable.pdf';
 
       final outcome = await ref.read(fileSaveServiceProvider).saveBytes(
             dialogTitle: 'حفظ ملف PDF',
-            fileName: 'timetable.pdf',
+            fileName: defaultFileName,
             allowedExtensions: ['pdf'],
             bytes: pdfBytes,
           );
@@ -210,6 +439,8 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
           ),
         );
       }
+    } finally {
+      _isExportingPdf = false;
     }
   }
 
@@ -422,7 +653,9 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
       for (final diagnostic in autoFixState.diagnostics)
         if (diagnostic.isHard) ...diagnostic.lessonIds,
     };
-    final isarAsync = ref.watch(isarDatabaseProvider);
+    final isarAsync = widget.pdfExportDataLoader != null
+        ? null
+        : ref.watch(isarDatabaseProvider);
 
     final scaffold = Scaffold(
       appBar: AppBar(
@@ -454,6 +687,9 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
         children: [
           lessonsAsync.when(
             data: (lessons) {
+              if (isarAsync == null) {
+                return const Center(child: Text('لا يوجد بيانات لعرضها.'));
+              }
               return isarAsync.when(
                 data: (isar) => FutureBuilder(
                   future: Future.wait([
@@ -520,7 +756,9 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
 
           // Off-screen export widget that is painted but invisible and unconstrained
           lessonsAsync.maybeWhen(
-            data: (lessons) => isarAsync.maybeWhen(
+            data: (lessons) => isarAsync == null
+                ? const SizedBox.shrink()
+                : isarAsync.maybeWhen(
               data: (isar) => FutureBuilder(
                 future: Future.wait([
                   isar.appSettings.where().findAll(),
@@ -764,7 +1002,9 @@ class _TimetablePageState extends ConsumerState<TimetablePage> {
       ),
     );
 
-    if (!Platform.isWindows) {
+    final isWindowsTarget = Platform.isWindows ||
+        Theme.of(context).platform == TargetPlatform.windows;
+    if (!isWindowsTarget) {
       return scaffold;
     }
 
