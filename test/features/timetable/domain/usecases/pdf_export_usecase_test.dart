@@ -100,9 +100,7 @@ class _FakeTimetableNotifier extends TimetableNotifier {
 class _RecordingFileSaveService extends FileSaveService {
   _RecordingFileSaveService({
     this.simulatedOutcome,
-  }) : super(
-          isDesktop: () => true,
-        );
+  });
 
   final FileSaveOutcome? simulatedOutcome;
   int saveCallCount = 0;
